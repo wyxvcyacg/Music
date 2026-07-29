@@ -107,6 +107,55 @@ impl ChunkStore {
         }
         Ok(out)
     }
+
+    /// 读取曲目 [start, start+len) 字节区间（用于流式播放的 Range 响应）。
+    /// 跨分片自动拼接。任一覆盖到的分片缺失则返回 Err(缺失的哈希)，
+    /// 供上层按需从 peer 拉取后重试。
+    pub fn read_range(
+        &self,
+        manifest: &TrackManifest,
+        start: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, String> {
+        let end = (start + len).min(manifest.total_size);
+        if start >= manifest.total_size || end <= start {
+            return Ok(Vec::new());
+        }
+        let store = self.chunks.lock().unwrap();
+        let cs = manifest.chunk_size;
+        let mut out = Vec::with_capacity(end - start);
+        let mut pos = start;
+        while pos < end {
+            let idx = pos / cs; // 该字节落在第几个分片
+            let hash = manifest
+                .chunks
+                .get(idx)
+                .ok_or_else(|| format!("range out of bounds: chunk index {idx}"))?;
+            let chunk = store
+                .get(hash)
+                .ok_or_else(|| format!("missing chunk: {hash}"))?;
+            let off = pos - idx * cs; // 分片内偏移
+            let take = (chunk.len() - off).min(end - pos);
+            out.extend_from_slice(&chunk[off..off + take]);
+            pos += take;
+        }
+        Ok(out)
+    }
+}
+
+/// 计算 [start, start+len) 区间覆盖的分片下标（含端点）。纯函数，便于测试。
+/// 返回 (first_idx, last_idx)；空区间返回 None。
+pub fn chunks_for_range(
+    total_size: usize,
+    chunk_size: usize,
+    start: usize,
+    len: usize,
+) -> Option<(usize, usize)> {
+    let end = (start + len).min(total_size);
+    if start >= total_size || end <= start || chunk_size == 0 {
+        return None;
+    }
+    Some((start / chunk_size, (end - 1) / chunk_size))
 }
 
 impl Default for ChunkStore {
@@ -156,5 +205,56 @@ mod tests {
             chunks: vec!["deadbeef".into()],
         };
         assert!(store.reassemble(&manifest).is_err());
+    }
+
+    #[test]
+    fn chunks_for_range_indices() {
+        // total 1000，分片 256 → 4 片：[0,256,512,768]
+        assert_eq!(chunks_for_range(1000, 256, 0, 100), Some((0, 0)));
+        // 跨片：200..300 覆盖片 0 和片 1
+        assert_eq!(chunks_for_range(1000, 256, 200, 100), Some((0, 1)));
+        // 末尾对齐：768..1000 只在片 3
+        assert_eq!(chunks_for_range(1000, 256, 768, 500), Some((3, 3)));
+        // 越界 start
+        assert_eq!(chunks_for_range(1000, 256, 1000, 10), None);
+        // 空长度
+        assert_eq!(chunks_for_range(1000, 256, 100, 0), None);
+    }
+
+    #[test]
+    fn read_range_spans_chunks() {
+        // 用小分片造 2.5 片数据，便于验证跨片读取。
+        let data: Vec<u8> = (0..650).map(|i| (i % 256) as u8).collect();
+        let store = ChunkStore::new();
+        let cs = 256usize;
+        let mut chunks = Vec::new();
+        for c in data.chunks(cs) {
+            let h = hash_bytes(c);
+            store.put(&h, c.to_vec());
+            chunks.push(h);
+        }
+        let manifest = TrackManifest {
+            track_hash: hash_bytes(&data),
+            total_size: data.len(),
+            chunk_size: cs,
+            chunks,
+        };
+
+        // 读一段跨越片0/片1边界的区间。
+        let got = store.read_range(&manifest, 200, 120).unwrap();
+        assert_eq!(got, &data[200..320]);
+
+        // 读到文件末尾（区间超出总长应被截断）。
+        let tail = store.read_range(&manifest, 600, 999).unwrap();
+        assert_eq!(tail, &data[600..650]);
+
+        // 缺片时报错。
+        let missing = TrackManifest {
+            chunks: vec!["deadbeef".into()],
+            total_size: 300,
+            chunk_size: cs,
+            track_hash: "x".into(),
+        };
+        assert!(store.read_range(&missing, 0, 100).is_err());
     }
 }

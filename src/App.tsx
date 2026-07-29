@@ -28,6 +28,7 @@ import {
   importTrack,
   reassemble,
   publishTrack,
+  prepareStream,
   listShared,
   downloadTrack,
   p2pStatus,
@@ -41,10 +42,12 @@ type Track = {
   id: number;
   title: string;
   artist: string;
-  /** 可播放音源 URL（Blob / object URL）。示例曲目为 undefined。 */
+  /** 可播放音源 URL（Blob / object URL / stream URL）。示例曲目为 undefined。 */
   url?: string;
   duration: string;
   manifest?: TrackManifest;
+  /** 媒体 MIME 类型（导入时捕获）。 */
+  mime?: string;
   status?: "importing" | "ready" | "error";
   /** 是否已发布到共享曲库。 */
   published?: boolean;
@@ -115,11 +118,13 @@ function App() {
 
   async function importOne(file: File): Promise<Track> {
     const id = nextId.current++;
+    const mime = file.type || "audio/mpeg";
     const base: Track = {
       id,
       title: file.name.replace(/\.[^.]+$/, ""),
       artist: "本地导入",
       duration: "--:--",
+      mime,
       status: "importing",
     };
     setTracks((prev) => [base, ...prev]);
@@ -138,7 +143,7 @@ function App() {
       if (restored.length !== bytes.length) {
         throw new Error(`length mismatch: ${restored.length} != ${bytes.length}`);
       }
-      const blob = new Blob([restored], { type: file.type || "audio/mpeg" });
+      const blob = new Blob([restored], { type: mime });
       const url = URL.createObjectURL(blob);
       const ready = { ...base, url, manifest, status: "ready" as const };
       patchTrack(id, ready);
@@ -166,7 +171,7 @@ function App() {
   async function onPublish(t: Track) {
     if (!t.manifest || !isTauri()) return;
     try {
-      await publishTrack(t.manifest, t.title, t.artist);
+      await publishTrack(t.manifest, t.title, t.artist, t.mime || "audio/mpeg");
       patchTrack(t.id, { published: true });
       refreshShared();
     } catch (e) {
@@ -174,14 +179,39 @@ function App() {
     }
   }
 
-  /** 从共享曲库下载一首曲目（分片从其他节点 P2P 拉取）。 */
+  /** 流式播放一首共享曲目（边下边播：分片按需从 peer 拉取）。 */
+  async function onStreamPlay(s: SharedTrack) {
+    if (!isTauri()) return;
+    try {
+      const url = await prepareStream(s.manifest, s.mime || "audio/mpeg");
+      const t: Track = {
+        id: nextId.current++,
+        title: s.title,
+        artist: s.artist,
+        url,
+        manifest: s.manifest,
+        mime: s.mime,
+        duration: "--:--",
+        status: "ready",
+        published: true,
+      };
+      setView("library");
+      setCurrent(t);
+      player.load(url, true);
+    } catch (e) {
+      console.error("stream play failed", e);
+      alert(`流式播放失败：${e}`);
+    }
+  }
+
+  /** 从共享曲库下载一首曲目完整收藏到本地（分片从其他节点 P2P 拉取）。 */
   async function onDownload(s: SharedTrack) {
     if (!isTauri()) return;
     const hash = s.manifest.track_hash;
     setDownloading((prev) => new Set(prev).add(hash));
     try {
       const result = await downloadTrack(s.manifest);
-      const blob = new Blob([result.data], { type: "audio/mpeg" });
+      const blob = new Blob([result.data], { type: s.mime || "audio/mpeg" });
       const url = URL.createObjectURL(blob);
       const t: Track = {
         id: nextId.current++,
@@ -189,6 +219,7 @@ function App() {
         artist: s.artist,
         url,
         manifest: s.manifest,
+        mime: s.mime,
         duration: "--:--",
         status: "ready",
         published: true,
@@ -300,6 +331,7 @@ function App() {
               downloading={downloading}
               trackerOnline={status?.tracker_online ?? false}
               onRefresh={refreshShared}
+              onStreamPlay={onStreamPlay}
               onDownload={onDownload}
             />
           )}
@@ -504,6 +536,7 @@ function NetworkView({
   downloading,
   trackerOnline,
   onRefresh,
+  onStreamPlay,
   onDownload,
 }: {
   shared: SharedTrack[];
@@ -511,6 +544,7 @@ function NetworkView({
   downloading: Set<string>;
   trackerOnline: boolean;
   onRefresh: () => void;
+  onStreamPlay: (s: SharedTrack) => void;
   onDownload: (s: SharedTrack) => void;
 }) {
   return (
@@ -519,7 +553,7 @@ function NetworkView({
         <div>
           <h1 className="text-2xl font-bold">节点网络</h1>
           <p className="text-sm text-muted-foreground">
-            共享曲库 —— 其他节点发布的曲目，分片将从持有者 P2P 拉取
+            共享曲库 —— 点「播放」即边下边播，分片按需从持有者 P2P 拉取
           </p>
         </div>
         <Button variant="outline" onClick={onRefresh}>
@@ -570,25 +604,32 @@ function NetworkView({
                     <td className="px-4 py-3 text-muted-foreground">
                       {fmtBytes(s.manifest.total_size)}
                     </td>
-                    <td className="px-4 py-3 text-right">
-                      {have ? (
-                        <span className="inline-flex items-center gap-1 text-xs text-emerald-400">
-                          <CheckCircle2 className="size-3.5" /> 本地已有
-                        </span>
-                      ) : (
-                        <Button
-                          size="sm"
-                          disabled={busy}
-                          onClick={() => onDownload(s)}
-                        >
-                          {busy ? (
-                            <Loader2 className="size-3.5 animate-spin" />
-                          ) : (
-                            <Download className="size-3.5" />
-                          )}
-                          {busy ? "下载中" : "下载"}
+                    <td className="px-4 py-3">
+                      <div className="flex items-center justify-end gap-2">
+                        <Button size="sm" onClick={() => onStreamPlay(s)}>
+                          <Play className="size-3.5" /> 播放
                         </Button>
-                      )}
+                        {have ? (
+                          <span className="inline-flex items-center gap-1 text-xs text-emerald-400">
+                            <CheckCircle2 className="size-3.5" /> 已缓存
+                          </span>
+                        ) : (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={busy}
+                            onClick={() => onDownload(s)}
+                            title="完整下载到本地"
+                          >
+                            {busy ? (
+                              <Loader2 className="size-3.5 animate-spin" />
+                            ) : (
+                              <Download className="size-3.5" />
+                            )}
+                            {busy ? "下载中" : "下载"}
+                          </Button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 );

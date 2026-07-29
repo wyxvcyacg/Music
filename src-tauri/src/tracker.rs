@@ -28,7 +28,7 @@ pub enum TrackerRequest {
     /// 查询谁持有某分片。
     Find { chunk: String },
     /// 发布一首曲目（连同清单），让别的节点能发现并下载。
-    Publish { manifest: TrackManifest, title: String, artist: String },
+    Publish { manifest: TrackManifest, title: String, artist: String, #[serde(default)] mime: String },
     /// 列出所有已发布曲目。
     List,
     /// 节点下线。
@@ -51,6 +51,9 @@ pub struct SharedTrack {
     pub manifest: TrackManifest,
     pub title: String,
     pub artist: String,
+    /// 媒体 MIME 类型（如 audio/mpeg），供流式播放设置 Content-Type。
+    #[serde(default)]
+    pub mime: String,
 }
 
 /// 已发布曲目表：track_hash -> SharedTrack。
@@ -70,10 +73,10 @@ fn handle(req: TrackerRequest, tracker: &InMemoryTracker, manifests: &ManifestSt
         TrackerRequest::Find { chunk } => TrackerResponse::Peers {
             peers: tracker.find_peers(&chunk),
         },
-        TrackerRequest::Publish { manifest, title, artist } => {
+        TrackerRequest::Publish { manifest, title, artist, mime } => {
             manifests.lock().unwrap().insert(
                 manifest.track_hash.clone(),
-                SharedTrack { manifest, title, artist },
+                SharedTrack { manifest, title, artist, mime },
             );
             TrackerResponse::Ok
         }

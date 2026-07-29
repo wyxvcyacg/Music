@@ -5,10 +5,14 @@
 //!   - 每个客户端启动时后台开一个分片服务（transfer.rs），并连上 Tracker 注册。
 //!   - 下载时按清单逐分片 find_peers -> fetch_chunk -> 校验入库 -> 重组播放。
 //!
+//! 流式播放：自定义 `stream://` 协议（stream.rs）实现边下边播 —— `<audio>` 按
+//! 字节区间请求，每个区间背后按需拉取所需分片。
+//!
 //! 账号系统留到阶段三，这里只有 peer_id，没有 user_id。
 
 mod chunk;
 mod peer;
+mod stream;
 mod tracker;
 mod transfer;
 
@@ -16,7 +20,9 @@ pub use tracker::{run_tracker, TRACKER_ADDR};
 
 use chunk::{ChunkStore, TrackManifest};
 use peer::{PeerDiscovery, PeerInfo, RemoteTracker};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use stream::{StreamCtx, StreamEntry};
 use tauri::{Manager, State};
 use tracker::{SharedTrack, TrackerRequest, TrackerResponse};
 use uuid::Uuid;
@@ -27,10 +33,24 @@ struct AppState {
     peer_id: String,
     /// 本节点分片服务的监听地址（供别的节点来拉分片）。
     chunk_addr: String,
-    /// 本地分片存储；Arc 与分片服务共享同一份。
+    /// 本地分片存储；Arc 与分片服务、流式协议共享同一份。
     store: Arc<ChunkStore>,
-    /// 远程 Tracker 客户端（实现 PeerDiscovery）。
-    tracker: RemoteTracker,
+    /// 远程 Tracker 客户端（实现 PeerDiscovery）；Arc 便于共享进协议线程。
+    tracker: Arc<RemoteTracker>,
+    /// 可流式播放曲目的登记表；与 stream 协议共享。
+    stream_registry: Arc<Mutex<HashMap<String, StreamEntry>>>,
+}
+
+impl AppState {
+    /// 派生流式协议所需的共享句柄。
+    fn stream_ctx(&self) -> StreamCtx {
+        StreamCtx {
+            peer_id: self.peer_id.clone(),
+            store: Arc::clone(&self.store),
+            tracker: Arc::clone(&self.tracker),
+            registry: Arc::clone(&self.stream_registry),
+        }
+    }
 }
 
 /// 导入一首曲目（字节数组）：切片、算哈希、存入本地 store，
@@ -42,19 +62,39 @@ fn import_track(state: State<AppState>, data: Vec<u8>) -> TrackManifest {
     manifest
 }
 
-/// 发布一首曲目到共享曲库，让别的节点能发现并下载。
+/// 登记一首曲目为可流式播放，返回 `<audio>` 可用的 stream URL。
+/// track_hash 对应的分片可以尚未全部在本地 —— 播放时按需从 peer 拉取。
+#[tauri::command]
+fn prepare_stream(state: State<AppState>, manifest: TrackManifest, mime: String) -> String {
+    let track_hash = manifest.track_hash.clone();
+    state.stream_ctx().register(manifest, mime);
+    // 自定义协议在各平台的 URL 形式不同：
+    //   Windows / Android: http://<scheme>.localhost/<path>
+    //   macOS / iOS / Linux: <scheme>://localhost/<path>
+    #[cfg(any(windows, target_os = "android"))]
+    {
+        format!("http://stream.localhost/{track_hash}")
+    }
+    #[cfg(not(any(windows, target_os = "android")))]
+    {
+        format!("stream://localhost/{track_hash}")
+    }
+}
+
+/// 发布一首曲目到共享曲库，让别的节点能发现并下载/流式播放。
 #[tauri::command]
 fn publish_track(
     state: State<AppState>,
     manifest: TrackManifest,
     title: String,
     artist: String,
+    mime: String,
 ) -> Result<(), String> {
     // 确保分片已在本地并向 Tracker 宣告（发布者即首个种子）。
     state.tracker.announce(&state.peer_id, &manifest.chunks);
     match state
         .tracker
-        .request(&TrackerRequest::Publish { manifest, title, artist })
+        .request(&TrackerRequest::Publish { manifest, title, artist, mime })
     {
         Ok(TrackerResponse::Ok) => Ok(()),
         Ok(other) => Err(format!("unexpected response: {other:?}")),
@@ -180,7 +220,7 @@ pub fn run() {
     println!("[client] peer_id={peer_id} chunk_addr={chunk_addr}");
 
     // 连接 Tracker 并注册自己（此刻还没有分片）。
-    let tracker = RemoteTracker::new(tracker::TRACKER_ADDR);
+    let tracker = Arc::new(RemoteTracker::new(tracker::TRACKER_ADDR));
     tracker.register(
         PeerInfo {
             peer_id: peer_id.clone(),
@@ -194,13 +234,39 @@ pub fn run() {
         chunk_addr,
         store,
         tracker,
+        stream_registry: Arc::new(Mutex::new(HashMap::new())),
     };
+    // 协议处理器需要的共享句柄（在 build 前克隆出来 move 进闭包）。
+    let stream_ctx = state.stream_ctx();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .register_asynchronous_uri_scheme_protocol("stream", move |_ctx, request, responder| {
+            let sc = stream_ctx.clone();
+            std::thread::spawn(move || {
+                let path = request.uri().path().to_string();
+                let range = request
+                    .headers()
+                    .get("range")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let (status, headers, body) =
+                    stream::handle_request(&sc, &path, range.as_deref());
+
+                let mut builder = tauri::http::Response::builder().status(status);
+                for (k, v) in headers {
+                    builder = builder.header(k, v);
+                }
+                match builder.body(body) {
+                    Ok(resp) => responder.respond(resp),
+                    Err(e) => eprintln!("[stream] build response failed: {e}"),
+                }
+            });
+        })
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             import_track,
+            prepare_stream,
             publish_track,
             list_shared,
             download_track,

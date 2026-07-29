@@ -21,6 +21,7 @@ export type SharedTrack = {
   manifest: TrackManifest;
   title: string;
   artist: string;
+  mime: string;
 };
 
 /** 与 Rust lib.rs 的 DownloadResult 对应。 */
@@ -49,9 +50,21 @@ export async function importTrack(data: Uint8Array): Promise<TrackManifest> {
 export async function publishTrack(
   manifest: TrackManifest,
   title: string,
-  artist: string
+  artist: string,
+  mime: string
 ): Promise<void> {
-  return invoke("publish_track", { manifest, title, artist });
+  return invoke("publish_track", { manifest, title, artist, mime });
+}
+
+/**
+ * 登记一首曲目为可流式播放，返回 `<audio>` 可直接用的 stream URL。
+ * 分片可尚未全部在本地 —— 播放时由 stream:// 协议按需从 peer 拉取（边下边播）。
+ */
+export async function prepareStream(
+  manifest: TrackManifest,
+  mime: string
+): Promise<string> {
+  return invoke<string>("prepare_stream", { manifest, mime });
 }
 
 /** 列出 Tracker 上所有已发布的共享曲目。 */
