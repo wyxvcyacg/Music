@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   Play,
   Pause,
@@ -12,34 +12,72 @@ import {
   ListMusic,
   Share2,
   Users,
+  Plus,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { usePlayer, fmtTime } from "@/hooks/usePlayer";
 
 type Track = {
   id: number;
   title: string;
   artist: string;
+  /** 本地导入的音源 URL（object URL）。示例曲目为 undefined，不可播放。 */
+  url?: string;
+  /** 时长文本；本地导入曲目载入元数据后填充。 */
   duration: string;
   peers: number;
 };
 
-const TRACKS: Track[] = [
+const DEMO_TRACKS: Track[] = [
   { id: 1, title: "Midnight City Lights", artist: "Neon Drive", duration: "3:42", peers: 12 },
   { id: 2, title: "Echoes in the Rain", artist: "Lo-Fi Collective", duration: "4:15", peers: 8 },
   { id: 3, title: "Digital Horizon", artist: "Synthwave Kid", duration: "5:01", peers: 24 },
   { id: 4, title: "Ocean of Static", artist: "Ambient Waves", duration: "6:20", peers: 3 },
-  { id: 5, title: "Retro Future", artist: "Neon Drive", duration: "3:58", peers: 17 },
-  { id: 6, title: "Quiet Streets", artist: "Lo-Fi Collective", duration: "2:47", peers: 5 },
 ];
 
 function App() {
-  const [current, setCurrent] = useState<Track>(TRACKS[0]);
-  const [playing, setPlaying] = useState(false);
-  const [progress] = useState(38); // % — mock buffer/play position
+  const player = usePlayer();
+  const [tracks, setTracks] = useState<Track[]>(DEMO_TRACKS);
+  const [current, setCurrent] = useState<Track | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const nextId = useRef(100);
+
+  function playTrack(t: Track) {
+    setCurrent(t);
+    if (t.url) player.load(t.url, true);
+  }
+
+  function onImportFiles(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    const imported: Track[] = Array.from(files).map((f) => ({
+      id: nextId.current++,
+      title: f.name.replace(/\.[^.]+$/, ""),
+      artist: "本地导入",
+      url: URL.createObjectURL(f),
+      duration: "--:--",
+      peers: 1, // 导入后本节点即持有 → 1 个来源
+    }));
+    setTracks((prev) => [...imported, ...prev]);
+    // 自动播放第一首导入的。
+    playTrack(imported[0]);
+  }
+
+  const played = player.duration ? (player.currentTime / player.duration) * 100 : 0;
+  const buffered = player.duration ? (player.buffered / player.duration) * 100 : 0;
 
   return (
     <div className="dark flex h-screen flex-col bg-background text-foreground">
+      {/* hidden file input for importing local audio */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="audio/*"
+        multiple
+        hidden
+        onChange={(e) => onImportFiles(e.target.files)}
+      />
+
       {/* main area */}
       <div className="flex flex-1 overflow-hidden">
         {/* sidebar */}
@@ -66,11 +104,16 @@ function App() {
 
         {/* track list */}
         <main className="flex-1 overflow-y-auto p-6">
-          <div className="mb-6">
-            <h1 className="text-2xl font-bold">曲库</h1>
-            <p className="text-sm text-muted-foreground">
-              边下边播 · 多源加速 · 人越多播放越流畅
-            </p>
+          <div className="mb-6 flex items-start justify-between">
+            <div>
+              <h1 className="text-2xl font-bold">曲库</h1>
+              <p className="text-sm text-muted-foreground">
+                边下边播 · 多源加速 · 人越多播放越流畅
+              </p>
+            </div>
+            <Button onClick={() => fileInputRef.current?.click()}>
+              <Plus /> 导入音乐
+            </Button>
           </div>
 
           <div className="overflow-hidden rounded-lg border border-border">
@@ -89,17 +132,16 @@ function App() {
                 </tr>
               </thead>
               <tbody>
-                {TRACKS.map((t, i) => (
+                {tracks.map((t, i) => (
                   <tr
                     key={t.id}
-                    onClick={() => {
-                      setCurrent(t);
-                      setPlaying(true);
-                    }}
+                    onClick={() => playTrack(t)}
                     className={cn(
                       "cursor-pointer border-t border-border transition-colors hover:bg-accent/50",
-                      current.id === t.id && "bg-accent/40"
+                      current?.id === t.id && "bg-accent/40",
+                      !t.url && "opacity-60"
                     )}
+                    title={t.url ? "" : "示例曲目（无音源）—— 点「导入音乐」添加可播放文件"}
                   >
                     <td className="px-4 py-3 text-muted-foreground">{i + 1}</td>
                     <td className="px-4 py-3 font-medium">{t.title}</td>
@@ -129,9 +171,11 @@ function App() {
               <ListMusic className="size-5 text-primary" />
             </div>
             <div className="min-w-0">
-              <div className="truncate text-sm font-medium">{current.title}</div>
+              <div className="truncate text-sm font-medium">
+                {current?.title ?? "未在播放"}
+              </div>
               <div className="truncate text-xs text-muted-foreground">
-                {current.artist}
+                {current?.artist ?? "点一首曲目开始"}
               </div>
             </div>
           </div>
@@ -148,9 +192,9 @@ function App() {
               <Button
                 size="icon"
                 className="size-10 rounded-full"
-                onClick={() => setPlaying((p) => !p)}
+                onClick={() => player.toggle()}
               >
-                {playing ? <Pause /> : <Play />}
+                {player.playing ? <Pause /> : <Play />}
               </Button>
               <Button variant="ghost" size="icon">
                 <SkipForward />
@@ -160,29 +204,45 @@ function App() {
               </Button>
             </div>
             <div className="flex w-full max-w-xl items-center gap-2 text-xs text-muted-foreground">
-              <span>1:24</span>
-              <div className="relative h-1 flex-1 overflow-hidden rounded-full bg-secondary">
+              <span className="w-9 text-right tabular-nums">
+                {fmtTime(player.currentTime)}
+              </span>
+              <div
+                className="group relative h-1.5 flex-1 cursor-pointer overflow-hidden rounded-full bg-secondary"
+                onClick={(e) => {
+                  if (!player.duration) return;
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const ratio = (e.clientX - rect.left) / rect.width;
+                  player.seek(ratio * player.duration);
+                }}
+              >
                 {/* buffered */}
                 <div
                   className="absolute inset-y-0 left-0 bg-muted-foreground/40"
-                  style={{ width: `${Math.min(progress + 25, 100)}%` }}
+                  style={{ width: `${buffered}%` }}
                 />
                 {/* played */}
                 <div
                   className="absolute inset-y-0 left-0 bg-primary"
-                  style={{ width: `${progress}%` }}
+                  style={{ width: `${played}%` }}
                 />
               </div>
-              <span>{current.duration}</span>
+              <span className="w-9 tabular-nums">{fmtTime(player.duration)}</span>
             </div>
           </div>
 
           {/* volume */}
           <div className="flex w-60 items-center justify-end gap-2">
             <Volume2 className="size-4 text-muted-foreground" />
-            <div className="h-1 w-24 overflow-hidden rounded-full bg-secondary">
-              <div className="h-full w-2/3 bg-muted-foreground" />
-            </div>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={player.volume}
+              onChange={(e) => player.setVolume(parseFloat(e.target.value))}
+              className="h-1 w-24 cursor-pointer accent-primary"
+            />
           </div>
         </div>
       </footer>
