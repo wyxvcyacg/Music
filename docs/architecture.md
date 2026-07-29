@@ -57,15 +57,23 @@ P2P 播放器里的"服务器"其实是两个职责完全不同的东西，从�
 
 把地基留出来，但每个阶段用最简实现，不提前造复杂度。
 
-### 阶段一（当前）——不做账号，做极简 Tracker
-- **账号**：写死本地用户 `user_id = "local"`，无登录 UI。
-- **Tracker**：进程内模块或本地小服务，内存维护「节点表 + 分片索引」。
-- **测试方式**：本机开多个客户端实例互相连接，验证 P2P 传输。
-- **约束**：网络层从一开始就通过 `PeerDiscovery` 抽象接口发现节点，不硬编码 IP。
+### 阶段一 ✅ 已完成 —— 不做账号，做极简 Tracker
+- **账号**：无登录 UI，节点只认随机生成的 `peer_id`。
+- **ChunkStore**（`chunk.rs`）：256 KiB 切片、SHA-256 内容寻址、去重、哈希校验、重组。
+- **Tracker**：进程内 `InMemoryTracker`，内存维护「节点表 + 分片索引」。
+- **前后端打通**：导入音频 → Rust 切片/哈希/入库 → 重组 → 播放，字节级无损。
+- **约束**：网络层通过 `PeerDiscovery` 抽象接口发现节点，不硬编码 IP。
 
-### 阶段二——P2P 传输跑通后
-- 把内存 Tracker 换成独立小服务（可仍在 localhost）。
-- 支持 NAT 穿透：引入 STUN / 信令流程。
+### 阶段二 ✅ 已完成 —— 跨进程真 P2P
+- **独立 Tracker 服务**（`tracker.rs`，`music --tracker`）：TCP + 行分隔 JSON 协议，
+  提供 register / announce / find / publish / list / unregister。
+- **RemoteTracker**（`peer.rs`）：实现同一个 `PeerDiscovery` trait，短连接请求 Tracker
+  —— 印证铁律之二，上层代码零改动即从内存实现切到远程。
+- **分片直传**（`transfer.rs`）：每个客户端后台开分片服务，节点间用 TCP 二进制协议
+  按哈希直传分片；下载时逐分片 `find_peers → fetch_chunk → 校验入库 → announce`。
+- **验证**：本机开 Tracker + 两个客户端，一端发布、另一端从共享曲库下载并播放，
+  分片真实跨进程传输；下载后本节点也成为该分片的源（多源分发）。
+- **本阶段边界**：仅本机/局域网；NAT 穿透、边下边播的流式下载留待后续。
 
 ### 阶段三（最后）——补账号系统
 - 登录 / 注册、token 鉴权。

@@ -46,15 +46,53 @@
               └─────────────────────┘
 ```
 
+## 技术栈
+
+- **桌面框架**：Tauri 2（Rust 后端 + WebView 前端）
+- **前端**：React 19 + Vite + TypeScript + Tailwind v4 + shadcn/ui
+- **P2P 核心**（Rust，标准库 `std::net` + `std::thread`，无额外运行时）：
+  - `chunk.rs` — 内容寻址的分片存储（256 KiB 切片、SHA-256、去重、重组）
+  - `peer.rs` — `PeerDiscovery` 抽象 + `InMemoryTracker` / `RemoteTracker`
+  - `tracker.rs` — 独立 Tracker 服务（TCP，JSON 协议）
+  - `transfer.rs` — 节点间分片直传（TCP，二进制协议）
+
 ## 快速开始
 
-> 项目开发中，构建与运行方式待补充。
+前置：[Node.js](https://nodejs.org/)、[Rust](https://rustup.rs/)、Windows 上需
+"Microsoft C++ Build Tools"。
 
 ```bash
 git clone https://github.com/wyxvcyacg/Music.git
 cd Music
-# 构建与运行说明待补充
+npm install
+npm run tauri dev        # 启动桌面客户端（开发模式）
 ```
+
+### 体验 P2P（本机双实例）
+
+阶段二已实现真正的跨进程 P2P 传输。验证方法：
+
+```bash
+# 1. 启动独立 Tracker 服务（节点发现，默认监听 127.0.0.1:9000）
+cd src-tauri
+cargo run -- --tracker
+
+# 2. 另开两个终端，各启动一个客户端实例
+npm run tauri dev
+```
+
+1. 在客户端 A：「导入音乐」选一首本地歌 → 点该曲目的「发布」
+2. 在客户端 B：切到「节点网络」→ 看到 A 发布的曲目 → 点「下载」
+3. 分片将从 A 的进程经 TCP 直传到 B，下载完成后自动播放
+
+侧边栏「P2P 状态」显示 Tracker 在线状态、本地持有分片数与本节点地址。
+
+### 测试
+
+```bash
+cd src-tauri && cargo test    # Rust 单元测试（分片重组、哈希校验、节点索引、分片直传）
+```
+
 
 ## 合规声明
 

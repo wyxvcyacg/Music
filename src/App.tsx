@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Play,
   Pause,
@@ -15,6 +15,11 @@ import {
   Plus,
   Boxes,
   Loader2,
+  Upload,
+  Download,
+  RefreshCw,
+  CheckCircle2,
+  CircleDot,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -22,10 +27,14 @@ import { usePlayer, fmtTime } from "@/hooks/usePlayer";
 import {
   importTrack,
   reassemble,
+  publishTrack,
+  listShared,
+  downloadTrack,
   p2pStatus,
   isTauri,
   type TrackManifest,
   type P2pStatus,
+  type SharedTrack,
 } from "@/lib/api";
 
 type Track = {
@@ -35,18 +44,16 @@ type Track = {
   /** 可播放音源 URL（Blob / object URL）。示例曲目为 undefined。 */
   url?: string;
   duration: string;
-  peers: number;
-  /** 经 Rust 切片后的清单（内容哈希 + 分片列表）。 */
   manifest?: TrackManifest;
-  /** 导入处理状态。 */
   status?: "importing" | "ready" | "error";
+  /** 是否已发布到共享曲库。 */
+  published?: boolean;
 };
 
 const DEMO_TRACKS: Track[] = [
-  { id: 1, title: "Midnight City Lights", artist: "Neon Drive", duration: "3:42", peers: 12 },
-  { id: 2, title: "Echoes in the Rain", artist: "Lo-Fi Collective", duration: "4:15", peers: 8 },
-  { id: 3, title: "Digital Horizon", artist: "Synthwave Kid", duration: "5:01", peers: 24 },
-  { id: 4, title: "Ocean of Static", artist: "Ambient Waves", duration: "6:20", peers: 3 },
+  { id: 1, title: "Midnight City Lights", artist: "Neon Drive", duration: "3:42" },
+  { id: 2, title: "Echoes in the Rain", artist: "Lo-Fi Collective", duration: "4:15" },
+  { id: 3, title: "Digital Horizon", artist: "Synthwave Kid", duration: "5:01" },
 ];
 
 function fmtBytes(n: number): string {
@@ -55,15 +62,21 @@ function fmtBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
+type View = "library" | "network";
+
 function App() {
   const player = usePlayer();
   const [tracks, setTracks] = useState<Track[]>(DEMO_TRACKS);
   const [current, setCurrent] = useState<Track | null>(null);
   const [status, setStatus] = useState<P2pStatus | null>(null);
+  const [shared, setShared] = useState<SharedTrack[]>([]);
+  const [view, setView] = useState<View>("library");
+  /** 正在下载的 track_hash 集合。 */
+  const [downloading, setDownloading] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const nextId = useRef(100);
 
-  // 轮询 P2P 状态（在 Tauri 内才有后端）。
+  // 轮询 P2P 状态。
   useEffect(() => {
     if (!isTauri()) return;
     let alive = true;
@@ -76,6 +89,20 @@ function App() {
     };
   }, []);
 
+  const refreshShared = useCallback(async () => {
+    if (!isTauri()) return;
+    try {
+      setShared(await listShared());
+    } catch (e) {
+      console.error("list shared failed", e);
+    }
+  }, []);
+
+  // 进入"节点网络"视图时刷新共享曲库。
+  useEffect(() => {
+    if (view === "network") refreshShared();
+  }, [view, refreshShared]);
+
   function playTrack(t: Track) {
     setCurrent(t);
     if (t.url) player.load(t.url, true);
@@ -86,11 +113,6 @@ function App() {
     setCurrent((c) => (c && c.id === id ? { ...c, ...patch } : c));
   }
 
-  /**
-   * 导入一个文件。在 Tauri 内走完整 P2P 路径：
-   *   bytes -> import_track(切片+哈希+入库) -> reassemble(重组) -> 播放重组结果
-   * 浏览器 dev 环境下降级为普通 object URL。
-   */
   async function importOne(file: File): Promise<Track> {
     const id = nextId.current++;
     const base: Track = {
@@ -98,15 +120,11 @@ function App() {
       title: file.name.replace(/\.[^.]+$/, ""),
       artist: "本地导入",
       duration: "--:--",
-      peers: 1,
       status: "importing",
     };
-
-    // 先把占位行放进列表。
     setTracks((prev) => [base, ...prev]);
 
     if (!isTauri()) {
-      // 浏览器环境：无后端，直接用 object URL。
       const url = URL.createObjectURL(file);
       const ready = { ...base, url, status: "ready" as const };
       patchTrack(id, ready);
@@ -115,15 +133,11 @@ function App() {
 
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
-      // 1. 送进 Rust：切片 + SHA-256 + 存入 ChunkStore + 向 Tracker 宣告
       const manifest = await importTrack(bytes);
-      // 2. 从 ChunkStore 按清单重组
       const restored = await reassemble(manifest);
-      // 3. 无损校验：字节数须与原文件一致
       if (restored.length !== bytes.length) {
         throw new Error(`length mismatch: ${restored.length} != ${bytes.length}`);
       }
-      // 4. 用重组后的字节构造可播放的 Blob URL
       const blob = new Blob([restored], { type: file.type || "audio/mpeg" });
       const url = URL.createObjectURL(blob);
       const ready = { ...base, url, manifest, status: "ready" as const };
@@ -138,10 +152,8 @@ function App() {
 
   async function onImportFiles(files: FileList | null) {
     if (!files || files.length === 0) return;
-    const list = Array.from(files);
-    // 逐个导入，第一首就绪后自动播放。
     let first = true;
-    for (const f of list) {
+    for (const f of Array.from(files)) {
       const t = await importOne(f);
       if (first && t.url) {
         playTrack(t);
@@ -150,8 +162,60 @@ function App() {
     }
   }
 
+  /** 发布一首已导入的曲目到共享曲库。 */
+  async function onPublish(t: Track) {
+    if (!t.manifest || !isTauri()) return;
+    try {
+      await publishTrack(t.manifest, t.title, t.artist);
+      patchTrack(t.id, { published: true });
+      refreshShared();
+    } catch (e) {
+      console.error("publish failed", e);
+    }
+  }
+
+  /** 从共享曲库下载一首曲目（分片从其他节点 P2P 拉取）。 */
+  async function onDownload(s: SharedTrack) {
+    if (!isTauri()) return;
+    const hash = s.manifest.track_hash;
+    setDownloading((prev) => new Set(prev).add(hash));
+    try {
+      const result = await downloadTrack(s.manifest);
+      const blob = new Blob([result.data], { type: "audio/mpeg" });
+      const url = URL.createObjectURL(blob);
+      const t: Track = {
+        id: nextId.current++,
+        title: s.title,
+        artist: s.artist,
+        url,
+        manifest: s.manifest,
+        duration: "--:--",
+        status: "ready",
+        published: true,
+      };
+      setTracks((prev) => [t, ...prev]);
+      setView("library");
+      playTrack(t);
+      console.log(
+        `downloaded ${s.title}: fetched ${result.fetched}, cached ${result.cached}`
+      );
+    } catch (e) {
+      console.error("download failed", e);
+      alert(`下载失败：${e}`);
+    } finally {
+      setDownloading((prev) => {
+        const next = new Set(prev);
+        next.delete(hash);
+        return next;
+      });
+    }
+  }
+
   const played = player.duration ? (player.currentTime / player.duration) * 100 : 0;
   const buffered = player.duration ? (player.buffered / player.duration) * 100 : 0;
+  const localHashes = new Set(
+    tracks.filter((t) => t.manifest).map((t) => t.manifest!.track_hash)
+  );
 
   return (
     <div className="dark flex h-screen flex-col bg-background text-foreground">
@@ -174,9 +238,19 @@ function App() {
             <span className="text-lg font-semibold">Music</span>
           </div>
           <NavItem icon={<Search className="size-4" />} label="搜索" />
-          <NavItem icon={<Library className="size-4" />} label="曲库" active />
+          <NavItem
+            icon={<Library className="size-4" />}
+            label="曲库"
+            active={view === "library"}
+            onClick={() => setView("library")}
+          />
           <NavItem icon={<ListMusic className="size-4" />} label="播放列表" />
-          <NavItem icon={<Users className="size-4" />} label="节点网络" />
+          <NavItem
+            icon={<Users className="size-4" />}
+            label="节点网络"
+            active={view === "network"}
+            onClick={() => setView("network")}
+          />
 
           <div className="mt-auto space-y-2 rounded-md bg-secondary/50 p-3 text-xs text-muted-foreground">
             <div className="flex items-center gap-1.5 font-medium text-foreground">
@@ -184,10 +258,21 @@ function App() {
             </div>
             {status ? (
               <>
-                <StatusRow label="在线节点" value={`${status.peer_count}`} />
+                <div className="flex items-center justify-between">
+                  <span>Tracker</span>
+                  <span
+                    className={cn(
+                      "flex items-center gap-1 font-medium",
+                      status.tracker_online ? "text-emerald-400" : "text-destructive"
+                    )}
+                  >
+                    <CircleDot className="size-3" />
+                    {status.tracker_online ? "在线" : "离线"}
+                  </span>
+                </div>
                 <StatusRow label="本地分片" value={`${status.owned_chunks}`} />
                 <div className="truncate pt-1 text-[10px] text-muted-foreground/70">
-                  peer: {status.peer_id.slice(0, 8)}…
+                  peer: {status.peer_id.slice(0, 8)}… @ {status.chunk_addr}
                 </div>
               </>
             ) : (
@@ -198,96 +283,26 @@ function App() {
           </div>
         </aside>
 
-        {/* track list */}
+        {/* content */}
         <main className="flex-1 overflow-y-auto p-6">
-          <div className="mb-6 flex items-start justify-between">
-            <div>
-              <h1 className="text-2xl font-bold">曲库</h1>
-              <p className="text-sm text-muted-foreground">
-                边下边播 · 多源加速 · 人越多播放越流畅
-              </p>
-            </div>
-            <Button onClick={() => fileInputRef.current?.click()}>
-              <Plus /> 导入音乐
-            </Button>
-          </div>
-
-          <div className="overflow-hidden rounded-lg border border-border">
-            <table className="w-full text-sm">
-              <thead className="bg-secondary/40 text-left text-xs text-muted-foreground">
-                <tr>
-                  <th className="w-10 px-4 py-2.5">#</th>
-                  <th className="px-4 py-2.5">标题</th>
-                  <th className="px-4 py-2.5">艺术家</th>
-                  <th className="px-4 py-2.5">
-                    <span className="flex items-center gap-1">
-                      <Boxes className="size-3.5" /> 分片
-                    </span>
-                  </th>
-                  <th className="px-4 py-2.5">
-                    <span className="flex items-center gap-1">
-                      <Users className="size-3.5" /> 节点
-                    </span>
-                  </th>
-                  <th className="px-4 py-2.5 text-right">时长</th>
-                </tr>
-              </thead>
-              <tbody>
-                {tracks.map((t, i) => (
-                  <tr
-                    key={t.id}
-                    onClick={() => t.url && playTrack(t)}
-                    className={cn(
-                      "border-t border-border transition-colors",
-                      t.url
-                        ? "cursor-pointer hover:bg-accent/50"
-                        : "cursor-default",
-                      current?.id === t.id && "bg-accent/40",
-                      !t.url && "opacity-60"
-                    )}
-                    title={
-                      t.manifest
-                        ? `track ${t.manifest.track_hash.slice(0, 12)}… · ${fmtBytes(
-                            t.manifest.total_size
-                          )}`
-                        : t.url
-                          ? ""
-                          : "示例曲目（无音源）—— 点「导入音乐」添加可播放文件"
-                    }
-                  >
-                    <td className="px-4 py-3 text-muted-foreground">{i + 1}</td>
-                    <td className="px-4 py-3 font-medium">
-                      <span className="flex items-center gap-2">
-                        {t.status === "importing" && (
-                          <Loader2 className="size-3.5 animate-spin text-primary" />
-                        )}
-                        {t.title}
-                        {t.status === "error" && (
-                          <span className="text-xs text-destructive">导入失败</span>
-                        )}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-muted-foreground">{t.artist}</td>
-                    <td className="px-4 py-3 text-muted-foreground">
-                      {t.manifest ? (
-                        <span className="tabular-nums">{t.manifest.chunks.length}</span>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary">
-                        {t.peers}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-right text-muted-foreground">
-                      {t.duration}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          {view === "library" ? (
+            <LibraryView
+              tracks={tracks}
+              current={current}
+              onPlay={playTrack}
+              onPublish={onPublish}
+              onImport={() => fileInputRef.current?.click()}
+            />
+          ) : (
+            <NetworkView
+              shared={shared}
+              localHashes={localHashes}
+              downloading={downloading}
+              trackerOnline={status?.tracker_online ?? false}
+              onRefresh={refreshShared}
+              onDownload={onDownload}
+            />
+          )}
         </main>
       </div>
 
@@ -374,6 +389,218 @@ function App() {
   );
 }
 
+function LibraryView({
+  tracks,
+  current,
+  onPlay,
+  onPublish,
+  onImport,
+}: {
+  tracks: Track[];
+  current: Track | null;
+  onPlay: (t: Track) => void;
+  onPublish: (t: Track) => void;
+  onImport: () => void;
+}) {
+  return (
+    <>
+      <div className="mb-6 flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">曲库</h1>
+          <p className="text-sm text-muted-foreground">
+            边下边播 · 多源加速 · 人越多播放越流畅
+          </p>
+        </div>
+        <Button onClick={onImport}>
+          <Plus /> 导入音乐
+        </Button>
+      </div>
+
+      <div className="overflow-hidden rounded-lg border border-border">
+        <table className="w-full text-sm">
+          <thead className="bg-secondary/40 text-left text-xs text-muted-foreground">
+            <tr>
+              <th className="w-10 px-4 py-2.5">#</th>
+              <th className="px-4 py-2.5">标题</th>
+              <th className="px-4 py-2.5">艺术家</th>
+              <th className="px-4 py-2.5">
+                <span className="flex items-center gap-1">
+                  <Boxes className="size-3.5" /> 分片
+                </span>
+              </th>
+              <th className="px-4 py-2.5 text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {tracks.map((t, i) => (
+              <tr
+                key={t.id}
+                onClick={() => t.url && onPlay(t)}
+                className={cn(
+                  "border-t border-border transition-colors",
+                  t.url ? "cursor-pointer hover:bg-accent/50" : "cursor-default",
+                  current?.id === t.id && "bg-accent/40",
+                  !t.url && "opacity-60"
+                )}
+                title={
+                  t.manifest
+                    ? `track ${t.manifest.track_hash.slice(0, 12)}… · ${fmtBytes(
+                        t.manifest.total_size
+                      )}`
+                    : ""
+                }
+              >
+                <td className="px-4 py-3 text-muted-foreground">{i + 1}</td>
+                <td className="px-4 py-3 font-medium">
+                  <span className="flex items-center gap-2">
+                    {t.status === "importing" && (
+                      <Loader2 className="size-3.5 animate-spin text-primary" />
+                    )}
+                    {t.title}
+                    {t.status === "error" && (
+                      <span className="text-xs text-destructive">导入失败</span>
+                    )}
+                  </span>
+                </td>
+                <td className="px-4 py-3 text-muted-foreground">{t.artist}</td>
+                <td className="px-4 py-3 text-muted-foreground">
+                  {t.manifest ? (
+                    <span className="tabular-nums">{t.manifest.chunks.length}</span>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+                <td className="px-4 py-3 text-right">
+                  {t.manifest &&
+                    (t.published ? (
+                      <span className="inline-flex items-center gap-1 text-xs text-emerald-400">
+                        <CheckCircle2 className="size-3.5" /> 已发布
+                      </span>
+                    ) : (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onPublish(t);
+                        }}
+                      >
+                        <Upload className="size-3.5" /> 发布
+                      </Button>
+                    ))}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+function NetworkView({
+  shared,
+  localHashes,
+  downloading,
+  trackerOnline,
+  onRefresh,
+  onDownload,
+}: {
+  shared: SharedTrack[];
+  localHashes: Set<string>;
+  downloading: Set<string>;
+  trackerOnline: boolean;
+  onRefresh: () => void;
+  onDownload: (s: SharedTrack) => void;
+}) {
+  return (
+    <>
+      <div className="mb-6 flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">节点网络</h1>
+          <p className="text-sm text-muted-foreground">
+            共享曲库 —— 其他节点发布的曲目，分片将从持有者 P2P 拉取
+          </p>
+        </div>
+        <Button variant="outline" onClick={onRefresh}>
+          <RefreshCw /> 刷新
+        </Button>
+      </div>
+
+      {!trackerOnline && (
+        <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+          Tracker 离线。请先启动 Tracker 服务：
+          <code className="ml-1 rounded bg-background/50 px-1.5 py-0.5 text-xs">
+            music --tracker
+          </code>
+        </div>
+      )}
+
+      {shared.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
+          共享曲库为空。在「曲库」里导入一首歌并点「发布」，或从另一个客户端发布。
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-lg border border-border">
+          <table className="w-full text-sm">
+            <thead className="bg-secondary/40 text-left text-xs text-muted-foreground">
+              <tr>
+                <th className="px-4 py-2.5">标题</th>
+                <th className="px-4 py-2.5">艺术家</th>
+                <th className="px-4 py-2.5">
+                  <span className="flex items-center gap-1">
+                    <Boxes className="size-3.5" /> 分片
+                  </span>
+                </th>
+                <th className="px-4 py-2.5">大小</th>
+                <th className="px-4 py-2.5 text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {shared.map((s) => {
+                const have = localHashes.has(s.manifest.track_hash);
+                const busy = downloading.has(s.manifest.track_hash);
+                return (
+                  <tr key={s.manifest.track_hash} className="border-t border-border">
+                    <td className="px-4 py-3 font-medium">{s.title}</td>
+                    <td className="px-4 py-3 text-muted-foreground">{s.artist}</td>
+                    <td className="px-4 py-3 tabular-nums text-muted-foreground">
+                      {s.manifest.chunks.length}
+                    </td>
+                    <td className="px-4 py-3 text-muted-foreground">
+                      {fmtBytes(s.manifest.total_size)}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      {have ? (
+                        <span className="inline-flex items-center gap-1 text-xs text-emerald-400">
+                          <CheckCircle2 className="size-3.5" /> 本地已有
+                        </span>
+                      ) : (
+                        <Button
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => onDownload(s)}
+                        >
+                          {busy ? (
+                            <Loader2 className="size-3.5 animate-spin" />
+                          ) : (
+                            <Download className="size-3.5" />
+                          )}
+                          {busy ? "下载中" : "下载"}
+                        </Button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </>
+  );
+}
+
 function StatusRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between">
@@ -387,13 +614,16 @@ function NavItem({
   icon,
   label,
   active,
+  onClick,
 }: {
   icon: React.ReactNode;
   label: string;
   active?: boolean;
+  onClick?: () => void;
 }) {
   return (
     <button
+      onClick={onClick}
       className={cn(
         "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
         active

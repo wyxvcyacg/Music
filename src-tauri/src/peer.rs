@@ -30,7 +30,8 @@ pub trait PeerDiscovery: Send + Sync {
     /// 节点下线。阶段二：客户端断连或退出时调用。
     #[allow(dead_code)]
     fn unregister(&self, peer_id: &str);
-    /// 当前在线节点数（调试/展示用）。
+    /// 当前在线节点数（调试/测试用）。
+    #[allow(dead_code)]
     fn peer_count(&self) -> usize;
 }
 
@@ -111,6 +112,92 @@ impl PeerDiscovery for InMemoryTracker {
         self.inner.lock().unwrap().peers.len()
     }
 }
+
+/// 远程 Tracker 客户端 —— 阶段二实现，实现同一个 PeerDiscovery trait。
+///
+/// 每次调用开一个短连接到 Tracker，发一行 JSON 请求、读一行 JSON 响应。
+/// 网络失败时采取"尽力而为"：查询类返回空，写入类静默忽略（不影响播放主流程）。
+pub struct RemoteTracker {
+    tracker_addr: String,
+    /// 本地缓存的在线节点数（保留给 peer_count；生产状态改用 tracker_online）。
+    #[allow(dead_code)]
+    last_peer_count: Mutex<usize>,
+}
+
+impl RemoteTracker {
+    pub fn new(tracker_addr: impl Into<String>) -> Self {
+        Self {
+            tracker_addr: tracker_addr.into(),
+            last_peer_count: Mutex::new(0),
+        }
+    }
+
+    /// 发一个请求，返回响应；任何 IO/解析错误都归一为 Err(String)。
+    pub fn request(
+        &self,
+        req: &crate::tracker::TrackerRequest,
+    ) -> Result<crate::tracker::TrackerResponse, String> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let mut stream = TcpStream::connect(&self.tracker_addr)
+            .map_err(|e| format!("connect tracker failed: {e}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .ok();
+
+        let mut line = serde_json::to_string(req).map_err(|e| e.to_string())?;
+        line.push('\n');
+        stream
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("send failed: {e}"))?;
+        stream.flush().ok();
+
+        let mut reader = BufReader::new(stream);
+        let mut resp_line = String::new();
+        reader
+            .read_line(&mut resp_line)
+            .map_err(|e| format!("read failed: {e}"))?;
+        serde_json::from_str(resp_line.trim()).map_err(|e| format!("bad response: {e}"))
+    }
+}
+
+impl PeerDiscovery for RemoteTracker {
+    fn register(&self, peer: PeerInfo, owned_chunks: &[String]) {
+        let _ = self.request(&crate::tracker::TrackerRequest::Register {
+            peer,
+            chunks: owned_chunks.to_vec(),
+        });
+    }
+
+    fn announce(&self, peer_id: &str, chunk_hashes: &[String]) {
+        let _ = self.request(&crate::tracker::TrackerRequest::Announce {
+            peer_id: peer_id.to_string(),
+            chunks: chunk_hashes.to_vec(),
+        });
+    }
+
+    fn find_peers(&self, chunk_hash: &str) -> Vec<PeerInfo> {
+        match self.request(&crate::tracker::TrackerRequest::Find {
+            chunk: chunk_hash.to_string(),
+        }) {
+            Ok(crate::tracker::TrackerResponse::Peers { peers }) => peers,
+            _ => Vec::new(),
+        }
+    }
+
+    fn unregister(&self, peer_id: &str) {
+        let _ = self.request(&crate::tracker::TrackerRequest::Unregister {
+            peer_id: peer_id.to_string(),
+        });
+    }
+
+    fn peer_count(&self) -> usize {
+        *self.last_peer_count.lock().unwrap()
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
