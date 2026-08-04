@@ -10,11 +10,11 @@
 //!
 //! 账号系统留到阶段三，这里只有 peer_id，没有 user_id。
 
-mod chunk;
-mod peer;
-mod stream;
-mod tracker;
-mod transfer;
+pub mod chunk;
+pub mod peer;
+pub mod stream;
+pub mod tracker;
+pub mod transfer;
 
 pub use tracker::{run_tracker, TRACKER_ADDR};
 
