@@ -112,6 +112,20 @@ fn list_shared(state: State<AppState>) -> Result<Vec<SharedTrack>, String> {
     }
 }
 
+/// 按 track_hash 查询单个共享曲目（粘贴链接后用）。
+/// 返回 None 表示 Tracker 上没有此 hash。
+#[tauri::command]
+fn lookup_track(state: State<AppState>, track_hash: String) -> Result<Option<SharedTrack>, String> {
+    match state
+        .tracker
+        .request(&TrackerRequest::Get { track_hash })
+    {
+        Ok(TrackerResponse::Track { item }) => Ok(item),
+        Ok(other) => Err(format!("unexpected response: {other:?}")),
+        Err(e) => Err(e),
+    }
+}
+
 /// 下载进度报告。
 #[derive(serde::Serialize)]
 struct DownloadResult {
@@ -269,6 +283,7 @@ pub fn run() {
             prepare_stream,
             publish_track,
             list_shared,
+            lookup_track,
             download_track,
             has_chunk,
             reassemble,

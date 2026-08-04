@@ -72,6 +72,32 @@ export async function listShared(): Promise<SharedTrack[]> {
   return invoke<SharedTrack[]>("list_shared");
 }
 
+/** 按 track_hash 查询单个共享曲目。返回 null 表示 Tracker 上没有。 */
+export async function lookupTrack(trackHash: string): Promise<SharedTrack | null> {
+  return invoke<SharedTrack | null>("lookup_track", { trackHash });
+}
+
+/**
+ * 曲目资源标识符 —— `music://track/<sha256>`。
+ * 这就是架构铁律之三"内容哈希寻址"对用户可见的形态：
+ * 拿到这串就能从 Tracker 找曲目并流式播放。
+ */
+export const TRACK_URI_SCHEME = "music://track/";
+
+export function makeTrackUri(trackHash: string): string {
+  return `${TRACK_URI_SCHEME}${trackHash}`;
+}
+
+/** 从粘贴板内容里解析 track hash；接受完整 URI 或裸 hash。 */
+export function parseTrackInput(input: string): string | null {
+  const s = input.trim();
+  if (!s) return null;
+  const m = s.match(/^music:\/\/track\/([a-fA-F0-9]{64})$/);
+  if (m) return m[1].toLowerCase();
+  if (/^[a-fA-F0-9]{64}$/.test(s)) return s.toLowerCase();
+  return null;
+}
+
 /**
  * 按清单下载一首曲目：Rust 逐分片从其他节点拉取、校验入库、重组，
  * 返回完整字节 + 本次下载/命中缓存的分片数。

@@ -31,6 +31,8 @@ pub enum TrackerRequest {
     Publish { manifest: TrackManifest, title: String, artist: String, #[serde(default)] mime: String },
     /// 列出所有已发布曲目。
     List,
+    /// 按 track_hash 查询单个共享曲目（用于"粘贴链接→播放"流程）。
+    Get { track_hash: String },
     /// 节点下线。
     Unregister { peer_id: String },
 }
@@ -42,6 +44,7 @@ pub enum TrackerResponse {
     Ok,
     Peers { peers: Vec<PeerInfo> },
     Manifests { items: Vec<SharedTrack> },
+    Track { item: Option<SharedTrack> },
     Error { message: String },
 }
 
@@ -82,6 +85,9 @@ fn handle(req: TrackerRequest, tracker: &InMemoryTracker, manifests: &ManifestSt
         }
         TrackerRequest::List => TrackerResponse::Manifests {
             items: manifests.lock().unwrap().values().cloned().collect(),
+        },
+        TrackerRequest::Get { track_hash } => TrackerResponse::Track {
+            item: manifests.lock().unwrap().get(&track_hash).cloned(),
         },
         TrackerRequest::Unregister { peer_id } => {
             tracker.unregister(&peer_id);

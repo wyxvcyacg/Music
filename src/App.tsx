@@ -20,6 +20,8 @@ import {
   RefreshCw,
   CheckCircle2,
   CircleDot,
+  Link as LinkIcon,
+  ClipboardPaste,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -30,9 +32,12 @@ import {
   publishTrack,
   prepareStream,
   listShared,
+  lookupTrack,
   downloadTrack,
   p2pStatus,
   isTauri,
+  makeTrackUri,
+  parseTrackInput,
   type TrackManifest,
   type P2pStatus,
   type SharedTrack,
@@ -76,6 +81,10 @@ function App() {
   const [view, setView] = useState<View>("library");
   /** 正在下载的 track_hash 集合。 */
   const [downloading, setDownloading] = useState<Set<string>>(new Set());
+  /** 粘贴链接输入框内容。 */
+  const [pasteInput, setPasteInput] = useState("");
+  /** 粘贴链接错误提示。 */
+  const [pasteError, setPasteError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const nextId = useRef(100);
 
@@ -242,6 +251,45 @@ function App() {
     }
   }
 
+  /** 复制曲目资源标识符（music://track/<hash>）到剪贴板。 */
+  async function onCopyLink(t: Track) {
+    if (!t.manifest) return;
+    const uri = makeTrackUri(t.manifest.track_hash);
+    try {
+      await navigator.clipboard.writeText(uri);
+    } catch {
+      // 退化方案：prompt 出来让用户自己复制
+      window.prompt("复制曲目链接", uri);
+    }
+  }
+
+  /** 处理粘贴链接：解析 → 查 Tracker → 走流式播放（与点「播放」一致）。 */
+  async function onPasteLink() {
+    setPasteError(null);
+    const hash = parseTrackInput(pasteInput);
+    if (!hash) {
+      setPasteError("格式不对，需要 music://track/<64位hash> 或 64位 hash 本身");
+      return;
+    }
+    if (!isTauri()) {
+      setPasteError("需要 Tauri 客户端");
+      return;
+    }
+    try {
+      const item = await lookupTrack(hash);
+      if (!item) {
+        setPasteError("Tracker 上找不到这首曲目（没人发布过）");
+        return;
+      }
+      setPasteInput("");
+      // 复用流式播放路径
+      await onStreamPlay(item);
+    } catch (e) {
+      console.error("paste link failed", e);
+      setPasteError(String(e));
+    }
+  }
+
   const played = player.duration ? (player.currentTime / player.duration) * 100 : 0;
   const buffered = player.duration ? (player.buffered / player.duration) * 100 : 0;
   const localHashes = new Set(
@@ -283,7 +331,41 @@ function App() {
             onClick={() => setView("network")}
           />
 
-          <div className="mt-auto space-y-2 rounded-md bg-secondary/50 p-3 text-xs text-muted-foreground">
+          <div className="mt-auto space-y-2">
+            <div className="rounded-md bg-secondary/50 p-3 text-xs text-muted-foreground">
+              <div className="mb-1.5 flex items-center gap-1.5 font-medium text-foreground">
+                <LinkIcon className="size-3.5" /> 粘贴链接播放
+              </div>
+              <div className="flex gap-1">
+                <input
+                  type="text"
+                  value={pasteInput}
+                  onChange={(e) => {
+                    setPasteInput(e.target.value);
+                    setPasteError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void onPasteLink();
+                  }}
+                  placeholder="music://track/..."
+                  className="min-w-0 flex-1 rounded border border-input bg-background px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-ring"
+                />
+                <Button
+                  size="icon"
+                  variant="secondary"
+                  className="size-7"
+                  onClick={() => void onPasteLink()}
+                  title="查找并播放"
+                >
+                  <ClipboardPaste className="size-3.5" />
+                </Button>
+              </div>
+              {pasteError && (
+                <div className="mt-1.5 text-[10px] text-destructive">{pasteError}</div>
+              )}
+            </div>
+
+            <div className="space-y-2 rounded-md bg-secondary/50 p-3 text-xs text-muted-foreground">
             <div className="flex items-center gap-1.5 font-medium text-foreground">
               <Share2 className="size-3.5" /> P2P 状态
             </div>
@@ -311,6 +393,7 @@ function App() {
                 {isTauri() ? "连接中…" : "浏览器预览（无后端）"}
               </div>
             )}
+            </div>
           </div>
         </aside>
 
@@ -322,6 +405,7 @@ function App() {
               current={current}
               onPlay={playTrack}
               onPublish={onPublish}
+              onCopyLink={onCopyLink}
               onImport={() => fileInputRef.current?.click()}
             />
           ) : (
@@ -426,12 +510,14 @@ function LibraryView({
   current,
   onPlay,
   onPublish,
+  onCopyLink,
   onImport,
 }: {
   tracks: Track[];
   current: Track | null;
   onPlay: (t: Track) => void;
   onPublish: (t: Track) => void;
+  onCopyLink: (t: Track) => void;
   onImport: () => void;
 }) {
   return (
@@ -503,23 +589,39 @@ function LibraryView({
                   )}
                 </td>
                 <td className="px-4 py-3 text-right">
-                  {t.manifest &&
-                    (t.published ? (
-                      <span className="inline-flex items-center gap-1 text-xs text-emerald-400">
-                        <CheckCircle2 className="size-3.5" /> 已发布
-                      </span>
-                    ) : (
+                  <div className="flex items-center justify-end gap-1">
+                    {t.manifest && (
                       <Button
                         variant="ghost"
-                        size="sm"
+                        size="icon"
+                        className="size-7"
+                        title="复制曲目链接"
                         onClick={(e) => {
                           e.stopPropagation();
-                          onPublish(t);
+                          onCopyLink(t);
                         }}
                       >
-                        <Upload className="size-3.5" /> 发布
+                        <LinkIcon className="size-3.5" />
                       </Button>
-                    ))}
+                    )}
+                    {t.manifest &&
+                      (t.published ? (
+                        <span className="inline-flex items-center gap-1 text-xs text-emerald-400">
+                          <CheckCircle2 className="size-3.5" /> 已发布
+                        </span>
+                      ) : (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onPublish(t);
+                          }}
+                        >
+                          <Upload className="size-3.5" /> 发布
+                        </Button>
+                      ))}
+                  </div>
                 </td>
               </tr>
             ))}
