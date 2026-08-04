@@ -69,30 +69,62 @@ npm install
 npm run tauri dev        # 启动桌面客户端（开发模式）
 ```
 
-### 体验 P2P（本机双实例）
+### 体验 P2P
 
-阶段二已实现真正的跨进程 P2P 传输。验证方法：
+阶段二/流式已在真机验证通过（Win11，2026-08）。三种粒度的体验：
+
+**A. 单实例验全链路（最简）**
 
 ```bash
-# 1. 启动独立 Tracker 服务（节点发现，默认监听 127.0.0.1:9000）
+# 终端 1：Tracker（节点发现，默认监听 127.0.0.1:9000）
 cd src-tauri
 cargo run -- --tracker
 
-# 2. 另开两个终端，各启动一个客户端实例
+# 终端 2：桌面客户端
+cd D:\Music
 npm run tauri dev
 ```
 
-1. 在客户端 A：「导入音乐」选一首本地歌 → 点该曲目的「发布」
-2. 在客户端 B：切到「节点网络」→ 看到 A 发布的曲目 → 点「播放」
-3. B 的 `<audio>` 通过 `stream://` 协议按需从 A 拉分片，**边下边播**（无需先下完整首）；
-   也可点「下载」把整首完整收藏到本地
+客户端 A：
+1. 导入一首本地 mp3 → 自动开始播放
+2. 这一行点「发布」→ 状态变为绿色"已发布"
+3. 切到「节点网络」→ 看到刚发布的曲目 → 点「播放」
+4. 播放条下方"已缓冲"灰色条从左到右渐进填满（这就是边下边播）
 
-侧边栏「P2P 状态」显示 Tracker 在线状态、本地持有分片数与本节点地址。
+**B. 双实例真 P2P**
+
+再开一个终端跑 `npm run tauri dev` 启第二个客户端 B：
+1. B 切到「节点网络」→ 看到 A 发布的曲目 → 点「播放」
+2. B 通过 `stream://` 协议按需从 A 进程拉分片（侧栏"本地分片"会从 0 涨到 N）
+3. 拖动播放条到任意位置 → 浏览器发新 Range → 继续从新位置起播
+4. 也可点「下载」完整收藏到本地
+
+**C. 命令行裸测（无 GUI）**
+
+`stream_server` 是给真机验证用的独立 HTTP 端点，模拟 stream:// 协议：
+```bash
+cd src-tauri
+cargo run --bin stream_server -- --import some.mp3 --port 9100
+# 记下打印的 track_hash，然后用 curl 验 Range：
+curl -v -H "Range: bytes=0-99" http://127.0.0.1:9100/<hash>
+```
+
+### 常见问题
+
+- **`error: failed to remove file ... music.exe 拒绝访问`**：后台残留进程占着产物。
+  杀干净再跑：
+  ```bash
+  cmd //c "taskkill /F /IM music.exe /T"
+  cmd //c "taskkill /F /IM stream_server.exe /T"
+  ```
+- **`could not determine which binary to run`**：项目里有 `music` 和 `stream_server` 两个 binary。
+  `Cargo.toml` 已设 `default-run = "music"`，但 `cargo run --bin stream_server ...` 仍可显式指定。
+- **侧栏 Tracker 一直显示"离线"**：终端 1 没起或端口 9000 被占。
 
 ### 测试
 
 ```bash
-cd src-tauri && cargo test    # Rust 单元测试（分片重组、哈希校验、节点索引、分片直传）
+cd src-tauri && cargo test    # 13 个单元测试：分片重组、哈希校验、节点索引、分片直传、Range 协议、跨片读取、206/404/416
 ```
 
 
