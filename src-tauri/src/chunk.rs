@@ -14,6 +14,33 @@ use std::sync::Mutex;
 /// 默认分片大小：256 KiB。流媒体场景下小分片利于快速起播与多源调度。
 pub const CHUNK_SIZE: usize = 256 * 1024;
 
+/// 缓存默认容量上限：2 GiB。超过后按 LRU 淘汰未受保护的分片。
+pub const DEFAULT_CACHE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+
+/// 淘汰目标水位 —— 降到上限的这个比例，避免刚好卡在上限反复触发淘汰。
+const EVICT_TARGET_RATIO: f64 = 0.8;
+
+/// 一次淘汰的结果（供日志/UI 展示）。
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct EvictReport {
+    /// 删除的分片数。
+    pub evicted: usize,
+    /// 释放的字节数。
+    pub bytes_freed: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// 把文件 mtime 刷成当前时间，作为 LRU 的"最近使用"标记。
+/// 失败无害 —— 只影响淘汰顺序的精度，不影响正确性。
+fn touch(path: &Path) {
+    let now = std::time::SystemTime::now();
+    let times = fs::FileTimes::new().set_accessed(now).set_modified(now);
+    if let Ok(f) = fs::File::options().write(true).open(path) {
+        let _ = f.set_times(times);
+    }
+}
+
 /// 对一段字节计算内容哈希（十六进制小写）。
 pub fn hash_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -110,12 +137,20 @@ impl ChunkStore {
     }
 
     /// 读取一个分片。响应其他节点的分片拉取请求，以及本地重组/区间读取。
+    ///
+    /// 磁盘模式下顺带把文件 mtime 刷成当前时间 —— 这就是 LRU 的"最近使用"
+    /// 记录，不需要额外的状态文件，且天然崩溃安全。
     pub fn get(&self, hash: &str) -> Option<Vec<u8>> {
         if !self.has(hash) {
             return None;
         }
         match &self.dir {
-            Some(dir) => fs::read(self.path_for(dir, hash)).ok(),
+            Some(dir) => {
+                let path = self.path_for(dir, hash);
+                let data = fs::read(&path).ok()?;
+                touch(&path);
+                Some(data)
+            }
             None => self.mem.lock().unwrap().get(hash).cloned(),
         }
     }
@@ -191,6 +226,57 @@ impl ChunkStore {
                 .map(|v| v.len() as u64)
                 .sum(),
         }
+    }
+
+    /// 按 LRU 淘汰缓存，直到占用降到 `limit` 的 `EVICT_TARGET_RATIO` 以下。
+    ///
+    /// `protected` 里的分片永不删除 —— 那是曲库里"我的收藏"用到的分片。
+    /// 其余（流式播放顺带缓存的过路分片）按 mtime 升序（最久未用优先）删除。
+    ///
+    /// 未超限则什么也不做。内存模式下不淘汰（进程退出即释放）。
+    pub fn evict_if_needed(&self, limit: u64, protected: &HashSet<String>) -> EvictReport {
+        let mut report = EvictReport::default();
+        let Some(dir) = &self.dir else { return report };
+
+        let used = self.cache_bytes();
+        report.bytes_before = used;
+        if used <= limit {
+            report.bytes_after = used;
+            return report;
+        }
+
+        // 收集可淘汰的候选：未受保护的分片 + 其 mtime 与大小。
+        let mut candidates: Vec<(std::time::SystemTime, u64, String)> = self
+            .owned_hashes()
+            .into_iter()
+            .filter(|h| !protected.contains(h))
+            .filter_map(|h| {
+                let meta = fs::metadata(self.path_for(dir, &h)).ok()?;
+                let mtime = meta.modified().ok()?;
+                Some((mtime, meta.len(), h))
+            })
+            .collect();
+
+        // 最久未用的排在前面。
+        candidates.sort_by_key(|(mtime, _, _)| *mtime);
+
+        let target = (limit as f64 * EVICT_TARGET_RATIO) as u64;
+        let mut current = used;
+
+        for (_, size, hash) in candidates {
+            if current <= target {
+                break;
+            }
+            if fs::remove_file(self.path_for(dir, &hash)).is_ok() {
+                self.index.lock().unwrap().remove(&hash);
+                current = current.saturating_sub(size);
+                report.evicted += 1;
+                report.bytes_freed += size;
+            }
+        }
+
+        report.bytes_after = current;
+        report
     }
 
     /// 按清单重组出完整曲目。缺任何一片则返回 Err(缺失的哈希)。
@@ -394,6 +480,91 @@ mod tests {
         let h = hash_bytes(&payload);
         store.put(&h, payload);
         assert_eq!(store.cache_bytes(), 4096);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 放 n 个各 `size` 字节的分片，返回它们的哈希（按放入顺序）。
+    /// 每次之间隔一点时间，让 mtime 有可区分的先后。
+    fn fill(store: &ChunkStore, n: usize, size: usize) -> Vec<String> {
+        let mut hashes = Vec::new();
+        for i in 0..n {
+            let payload = vec![i as u8; size];
+            let h = hash_bytes(&payload);
+            store.put(&h, payload);
+            hashes.push(h);
+            // 文件时间戳精度有限，睡一下确保顺序可分辨。
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        hashes
+    }
+
+    #[test]
+    fn evict_does_nothing_under_limit() {
+        let dir = temp_dir("evict_noop");
+        let store = ChunkStore::open(&dir).unwrap();
+        let hashes = fill(&store, 3, 1000);
+
+        // 上限远大于占用 → 不该删任何东西。
+        let report = store.evict_if_needed(1_000_000, &HashSet::new());
+        assert_eq!(report.evicted, 0);
+        for h in &hashes {
+            assert!(store.has(h));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evict_removes_least_recently_used_first() {
+        let dir = temp_dir("evict_lru");
+        let store = ChunkStore::open(&dir).unwrap();
+        // 5 片 × 1000 字节 = 5000。
+        let hashes = fill(&store, 5, 1000);
+
+        // 读第 0 片，把它刷成"最近使用" —— 它应当最后才被淘汰。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(store.get(&hashes[0]).is_some());
+
+        // 上限 3000 → 目标水位 2400，需要腾出 ~2600 字节（约 3 片）。
+        let report = store.evict_if_needed(3000, &HashSet::new());
+        assert!(report.evicted >= 2, "expected eviction, got {report:?}");
+        assert!(
+            report.bytes_after <= 2400,
+            "should reach target watermark, got {report:?}"
+        );
+
+        // 刚被读过的第 0 片应当还在（它是最近使用的）。
+        assert!(
+            store.has(&hashes[0]),
+            "recently-used chunk should survive eviction"
+        );
+        // 最久未用的第 1 片应当已被删。
+        assert!(!store.has(&hashes[1]), "LRU chunk should be evicted");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evict_never_removes_protected_chunks() {
+        let dir = temp_dir("evict_protect");
+        let store = ChunkStore::open(&dir).unwrap();
+        let hashes = fill(&store, 5, 1000);
+
+        // 把最久未用的两片标为受保护（模拟"曲库里的收藏"）。
+        let protected: HashSet<String> =
+            [hashes[0].clone(), hashes[1].clone()].into_iter().collect();
+
+        // 上限很小，逼它尽量淘汰。
+        let report = store.evict_if_needed(1000, &protected);
+
+        // 受保护的必须还在，哪怕它们是最久未用的。
+        for h in &protected {
+            assert!(store.has(h), "protected chunk was evicted: {h}");
+        }
+        // 未受保护的应当被删光（3 片）。
+        assert_eq!(report.evicted, 3, "should evict all unprotected: {report:?}");
+        assert_eq!(store.chunk_count(), 2, "only protected should remain");
 
         let _ = fs::remove_dir_all(&dir);
     }

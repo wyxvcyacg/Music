@@ -22,6 +22,7 @@ import {
   CircleDot,
   Link as LinkIcon,
   ClipboardPaste,
+  Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -36,6 +37,8 @@ import {
   downloadTrack,
   p2pStatus,
   cacheStats,
+  listLibrary,
+  removeFromLibrary,
   isTauri,
   makeTrackUri,
   parseTrackInput,
@@ -60,6 +63,7 @@ type Track = {
   published?: boolean;
 };
 
+/// 浏览器预览（无后端）时展示的示例数据；Tauri 内会被真实曲库替换。
 const DEMO_TRACKS: Track[] = [
   { id: 1, title: "Midnight City Lights", artist: "Neon Drive", duration: "3:42" },
   { id: 2, title: "Echoes in the Rain", artist: "Lo-Fi Collective", duration: "4:15" },
@@ -69,14 +73,15 @@ const DEMO_TRACKS: Track[] = [
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
 type View = "library" | "network";
 
 function App() {
   const player = usePlayer();
-  const [tracks, setTracks] = useState<Track[]>(DEMO_TRACKS);
+  const [tracks, setTracks] = useState<Track[]>(isTauri() ? [] : DEMO_TRACKS);
   const [current, setCurrent] = useState<Track | null>(null);
   const [status, setStatus] = useState<P2pStatus | null>(null);
   const [cache, setCache] = useState<CacheStats | null>(null);
@@ -104,6 +109,44 @@ function App() {
     return () => {
       alive = false;
       clearInterval(timer);
+    };
+  }, []);
+
+  // 启动时恢复持久化曲库。分片都在本地，所以 stream URL 可离线秒播。
+  useEffect(() => {
+    if (!isTauri()) return;
+    let alive = true;
+    (async () => {
+      try {
+        const saved = await listLibrary();
+        if (!alive || saved.length === 0) return;
+        const restored: Track[] = [];
+        for (const t of saved) {
+          const mime = t.mime || "audio/mpeg";
+          let url: string | undefined;
+          try {
+            url = await prepareStream(t.manifest, mime);
+          } catch (e) {
+            console.error("prepare stream failed for", t.title, e);
+          }
+          restored.push({
+            id: nextId.current++,
+            title: t.title,
+            artist: t.artist,
+            url,
+            manifest: t.manifest,
+            mime,
+            duration: "--:--",
+            status: "ready",
+          });
+        }
+        if (alive) setTracks(restored);
+      } catch (e) {
+        console.error("restore library failed", e);
+      }
+    })();
+    return () => {
+      alive = false;
     };
   }, []);
 
@@ -153,7 +196,7 @@ function App() {
 
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
-      const manifest = await importTrack(bytes);
+      const manifest = await importTrack(bytes, base.title, base.artist, mime);
       const restored = await reassemble(manifest);
       if (restored.length !== bytes.length) {
         throw new Error(`length mismatch: ${restored.length} != ${bytes.length}`);
@@ -225,7 +268,12 @@ function App() {
     const hash = s.manifest.track_hash;
     setDownloading((prev) => new Set(prev).add(hash));
     try {
-      const result = await downloadTrack(s.manifest);
+      const result = await downloadTrack(
+        s.manifest,
+        s.title,
+        s.artist,
+        s.mime || "audio/mpeg"
+      );
       const blob = new Blob([result.data], { type: s.mime || "audio/mpeg" });
       const url = URL.createObjectURL(blob);
       const t: Track = {
@@ -266,6 +314,25 @@ function App() {
     } catch {
       // 退化方案：prompt 出来让用户自己复制
       window.prompt("复制曲目链接", uri);
+    }
+  }
+
+  /** 从曲库移除一首曲目（分片留给缓存淘汰按需回收）。 */
+  async function onRemove(t: Track) {
+    if (!t.manifest || !isTauri()) return;
+    try {
+      await removeFromLibrary(t.manifest.track_hash);
+      setTracks((prev) => prev.filter((x) => x.id !== t.id));
+      // 正在播的被移除时停下并清空当前曲目。
+      setCurrent((c) => {
+        if (c?.id === t.id) {
+          player.stop();
+          return null;
+        }
+        return c;
+      });
+    } catch (e) {
+      console.error("remove failed", e);
     }
   }
 
@@ -391,7 +458,10 @@ function App() {
                 </div>
                 <StatusRow label="本地分片" value={`${status.owned_chunks}`} />
                 {cache && (
-                  <StatusRow label="缓存占用" value={fmtBytes(cache.bytes)} />
+                  <StatusRow
+                    label="缓存占用"
+                    value={`${fmtBytes(cache.bytes)} / ${fmtBytes(cache.limit)}`}
+                  />
                 )}
                 <div className="truncate pt-1 text-[10px] text-muted-foreground/70">
                   peer: {status.peer_id.slice(0, 8)}… @ {status.chunk_addr}
@@ -415,6 +485,7 @@ function App() {
               onPlay={playTrack}
               onPublish={onPublish}
               onCopyLink={onCopyLink}
+              onRemove={onRemove}
               onImport={() => fileInputRef.current?.click()}
             />
           ) : (
@@ -520,6 +591,7 @@ function LibraryView({
   onPlay,
   onPublish,
   onCopyLink,
+  onRemove,
   onImport,
 }: {
   tracks: Track[];
@@ -527,6 +599,7 @@ function LibraryView({
   onPlay: (t: Track) => void;
   onPublish: (t: Track) => void;
   onCopyLink: (t: Track) => void;
+  onRemove: (t: Track) => void;
   onImport: () => void;
 }) {
   return (
@@ -544,6 +617,11 @@ function LibraryView({
       </div>
 
       <div className="overflow-hidden rounded-lg border border-border">
+        {tracks.length === 0 ? (
+          <div className="p-10 text-center text-sm text-muted-foreground">
+            曲库为空。点右上「导入音乐」添加本地文件，或去「节点网络」下载别人分享的曲目。
+          </div>
+        ) : (
         <table className="w-full text-sm">
           <thead className="bg-secondary/40 text-left text-xs text-muted-foreground">
             <tr>
@@ -630,12 +708,27 @@ function LibraryView({
                           <Upload className="size-3.5" /> 发布
                         </Button>
                       ))}
+                    {t.manifest && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-7 text-muted-foreground hover:text-destructive"
+                        title="从曲库移除"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onRemove(t);
+                        }}
+                      >
+                        <Trash2 className="size-3.5" />
+                      </Button>
+                    )}
                   </div>
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
+        )}
       </div>
     </>
   );

@@ -38,12 +38,41 @@ export function isTauri(): boolean {
 
 /**
  * 导入一首曲目：把字节送进 Rust，切片 + 算哈希 + 存入 ChunkStore，
- * 并向 Tracker 宣告，返回清单。
+ * 向 Tracker 宣告，并加入持久化曲库。
  */
-export async function importTrack(data: Uint8Array): Promise<TrackManifest> {
+export async function importTrack(
+  data: Uint8Array,
+  title: string,
+  artist: string,
+  mime: string
+): Promise<TrackManifest> {
   // Tauri 的 invoke 会把数组序列化为 JSON number[]；
   // 对音频这类大数据这是阶段一/二的可接受折中，后续改用流式/二进制通道。
-  return invoke<TrackManifest>("import_track", { data: Array.from(data) });
+  return invoke<TrackManifest>("import_track", {
+    data: Array.from(data),
+    title,
+    artist,
+    mime,
+  });
+}
+
+/** 与 Rust library.rs 的 LibraryTrack 对应 —— 持久化曲库里的一条曲目。 */
+export type LibraryTrack = {
+  manifest: TrackManifest;
+  title: string;
+  artist: string;
+  mime: string;
+  added_at: number;
+};
+
+/** 列出持久化的本地曲库（启动时恢复）。 */
+export async function listLibrary(): Promise<LibraryTrack[]> {
+  return invoke<LibraryTrack[]>("list_library");
+}
+
+/** 从曲库移除一首曲目（分片留给缓存淘汰回收）。 */
+export async function removeFromLibrary(trackHash: string): Promise<boolean> {
+  return invoke<boolean>("remove_from_library", { trackHash });
 }
 
 /** 发布一首曲目到共享曲库（Tracker 上的其他节点可发现并下载）。 */
@@ -102,10 +131,15 @@ export function parseTrackInput(input: string): string | null {
  * 按清单下载一首曲目：Rust 逐分片从其他节点拉取、校验入库、重组，
  * 返回完整字节 + 本次下载/命中缓存的分片数。
  */
-export async function downloadTrack(manifest: TrackManifest): Promise<DownloadResult> {
+export async function downloadTrack(
+  manifest: TrackManifest,
+  title: string,
+  artist: string,
+  mime: string
+): Promise<DownloadResult> {
   const r = await invoke<{ data: number[]; fetched: number; cached: number }>(
     "download_track",
-    { manifest }
+    { manifest, title, artist, mime }
   );
   return { data: new Uint8Array(r.data), fetched: r.fetched, cached: r.cached };
 }
@@ -130,6 +164,7 @@ export async function p2pStatus(): Promise<P2pStatus> {
 export type CacheStats = {
   chunks: number;
   bytes: number;
+  limit: number;
 };
 
 /** 本地分片缓存统计（磁盘占用）。 */

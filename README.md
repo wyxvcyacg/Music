@@ -17,7 +17,7 @@
 - [x] 分片传输协议：曲目切片、分片索引、多源调度与去重
 - [x] 流式播放引擎：边下边播（`stream://` 协议 + HTTP Range 按需拉分片）
 - [x] 音频解码与播放：由 WebView `<audio>` 原生解码（MP3 / FLAC / AAC / OGG 等）
-- [x] 本地资源库：曲库管理、缓存复用、分片磁盘持久化（跨重启保留）
+- [x] 本地资源库：曲库持久化（跨重启恢复）、分片磁盘缓存、带保护的 LRU 淘汰（默认 2 GiB）
 - [ ] 桌面 UI：播放控制、进度/缓冲可视化、传输状态（进行中）
 - [x] 种子/资源标识：基于内容哈希的曲目寻址（SHA-256 分片定位）
 
@@ -51,7 +51,8 @@
 - **桌面框架**：Tauri 2（Rust 后端 + WebView 前端）
 - **前端**：React 19 + Vite + TypeScript + Tailwind v4 + shadcn/ui
 - **P2P 核心**（Rust，标准库 `std::net` + `std::thread`，无额外运行时）：
-  - `chunk.rs` — 内容寻址的分片存储（256 KiB 切片、SHA-256、去重、重组、区间读取、磁盘持久化）
+  - `chunk.rs` — 内容寻址的分片存储（256 KiB 切片、SHA-256、去重、重组、区间读取、磁盘持久化、LRU 淘汰）
+  - `library.rs` — 本地曲库持久化（JSON），同时定义淘汰的受保护分片集合
   - `peer.rs` — `PeerDiscovery` 抽象 + `InMemoryTracker` / `RemoteTracker`
   - `tracker.rs` — 独立 Tracker 服务（TCP，JSON 协议）
   - `transfer.rs` — 节点间分片直传（TCP，二进制协议）+ 并行多源拉取（默认并发 4）
@@ -124,7 +125,7 @@ curl -v -H "Range: bytes=0-99" http://127.0.0.1:9100/<hash>
 ### 测试
 
 ```bash
-cd src-tauri && cargo test    # 22 个单元测试：分片重组/持久化、哈希校验、节点索引、分片直传、并行多源拉取、Range 协议、跨片读取、206/404/416
+cd src-tauri && cargo test    # 30 个单元测试：分片重组/持久化/淘汰、曲库读写、哈希校验、节点索引、分片直传、并行多源拉取、Range 协议、跨片读取、206/404/416
 ```
 
 

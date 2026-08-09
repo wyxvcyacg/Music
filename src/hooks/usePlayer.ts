@@ -102,7 +102,23 @@ export function usePlayer() {
     setState((s) => ({ ...s, volume: clamped }));
   }, []);
 
-  return { ...state, load, toggle, seek, setVolume };
+  /** 停止播放并清空音源（例如当前曲目被移除时）。 */
+  const stop = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+    setState((s) => ({
+      ...s,
+      playing: false,
+      currentTime: 0,
+      duration: 0,
+      buffered: 0,
+    }));
+  }, []);
+
+  return { ...state, load, toggle, seek, setVolume, stop };
 }
 
 /** 秒 → m:ss */

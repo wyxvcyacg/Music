@@ -11,6 +11,7 @@
 //! 账号系统留到阶段三，这里只有 peer_id，没有 user_id。
 
 pub mod chunk;
+pub mod library;
 pub mod peer;
 pub mod stream;
 pub mod tracker;
@@ -19,6 +20,7 @@ pub mod transfer;
 pub use tracker::{run_tracker, TRACKER_ADDR};
 
 use chunk::{ChunkStore, TrackManifest};
+use library::{Library, LibraryTrack};
 use peer::{PeerDiscovery, PeerInfo, RemoteTracker};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -39,6 +41,8 @@ struct AppState {
     tracker: Arc<RemoteTracker>,
     /// 可流式播放曲目的登记表；与 stream 协议共享。
     stream_registry: Arc<Mutex<HashMap<String, StreamEntry>>>,
+    /// 持久化的本地曲库 —— 同时定义了缓存淘汰的"受保护"分片集合。
+    lib: Arc<Library>,
 }
 
 impl AppState {
@@ -51,15 +55,60 @@ impl AppState {
             registry: Arc::clone(&self.stream_registry),
         }
     }
+
+    /// 加入曲库后触发一次缓存淘汰检查。
+    /// 曲库里的分片受保护，只回收流式播放顺带缓存的过路分片。
+    fn enforce_cache_limit(&self) {
+        let protected = self.lib.protected_hashes();
+        let report = self
+            .store
+            .evict_if_needed(chunk::DEFAULT_CACHE_LIMIT, &protected);
+        if report.evicted > 0 {
+            println!(
+                "[cache] evicted {} chunks, freed {} bytes ({} -> {})",
+                report.evicted, report.bytes_freed, report.bytes_before, report.bytes_after
+            );
+        }
+    }
 }
 
 /// 导入一首曲目（字节数组）：切片、算哈希、存入本地 store，
-/// 并把持有的分片向 Tracker 宣告，返回清单。
+/// 向 Tracker 宣告，加入曲库并持久化，返回清单。
 #[tauri::command]
-fn import_track(state: State<AppState>, data: Vec<u8>) -> TrackManifest {
+fn import_track(
+    state: State<AppState>,
+    data: Vec<u8>,
+    title: String,
+    artist: String,
+    mime: String,
+) -> TrackManifest {
     let manifest = state.store.import_track(&data);
     state.tracker.announce(&state.peer_id, &manifest.chunks);
+    state.lib.add(library::make_track(
+        manifest.clone(),
+        title,
+        artist,
+        mime,
+    ));
+    state.enforce_cache_limit();
     manifest
+}
+
+/// 列出持久化的本地曲库（启动时恢复用）。
+#[tauri::command]
+fn list_library(state: State<AppState>) -> Vec<LibraryTrack> {
+    state.lib.list()
+}
+
+/// 从曲库移除一首曲目。只移除条目，分片留给缓存淘汰按需回收
+/// —— 移除后它们不再受保护。
+#[tauri::command]
+fn remove_from_library(state: State<AppState>, track_hash: String) -> bool {
+    let removed = state.lib.remove(&track_hash);
+    if removed {
+        state.enforce_cache_limit();
+    }
+    removed
 }
 
 /// 登记一首曲目为可流式播放，返回 `<audio>` 可用的 stream URL。
@@ -141,7 +190,13 @@ struct DownloadResult {
 /// 校验入库后批量向 Tracker 宣告，全部就绪后重组返回。
 /// 本地已有的分片跳过下载（P2P 缓存复用）。
 #[tauri::command]
-fn download_track(state: State<AppState>, manifest: TrackManifest) -> Result<DownloadResult, String> {
+fn download_track(
+    state: State<AppState>,
+    manifest: TrackManifest,
+    title: String,
+    artist: String,
+    mime: String,
+) -> Result<DownloadResult, String> {
     // 分出"本地已有"与"需要拉取"。
     let mut missing = Vec::new();
     let mut cached = 0usize;
@@ -174,6 +229,14 @@ fn download_track(state: State<AppState>, manifest: TrackManifest) -> Result<Dow
     }
 
     let data = state.store.reassemble(&manifest)?;
+    // 完整下载 = 收藏到本地：加入曲库，其分片从此受保护。
+    state.lib.add(library::make_track(
+        manifest.clone(),
+        title,
+        artist,
+        mime,
+    ));
+    state.enforce_cache_limit();
     Ok(DownloadResult {
         data,
         fetched: fetched_hashes.len(),
@@ -222,6 +285,8 @@ fn p2p_status(state: State<AppState>) -> P2pStatus {
 struct CacheStats {
     chunks: usize,
     bytes: u64,
+    /// 容量上限；超过后按 LRU 淘汰未受保护的分片。
+    limit: u64,
 }
 
 #[tauri::command]
@@ -229,6 +294,7 @@ fn cache_stats(state: State<AppState>) -> CacheStats {
     CacheStats {
         chunks: state.store.chunk_count(),
         bytes: state.store.cache_bytes(),
+        limit: chunk::DEFAULT_CACHE_LIMIT,
     }
 }
 
@@ -284,16 +350,19 @@ pub fn run() {
             reassemble,
             p2p_status,
             cache_stats,
+            list_library,
+            remove_from_library,
         ])
         .setup(|app| {
             let peer_id = Uuid::new_v4().to_string();
 
-            // 分片缓存：优先磁盘持久化（跨重启保留，也能继续给别人供片）。
-            // 拿不到目录或打不开就回退到内存模式，不影响可用性。
-            let store = match app.path().app_data_dir() {
-                Ok(base) => {
+            // 分片缓存与曲库都放在 app_data_dir 下。拿不到目录时回退到
+            // 内存模式（缓存与曲库都不持久化），不影响基本可用性。
+            let data_dir = app.path().app_data_dir().ok();
+            let (store, lib) = match &data_dir {
+                Some(base) => {
                     let dir = base.join("chunks");
-                    match ChunkStore::open(&dir) {
+                    let store = match ChunkStore::open(&dir) {
                         Ok(s) => {
                             println!(
                                 "[client] chunk cache: {} ({} chunks restored)",
@@ -306,11 +375,14 @@ pub fn run() {
                             eprintln!("[client] disk cache unavailable ({e}), using memory");
                             Arc::new(ChunkStore::new())
                         }
-                    }
+                    };
+                    let lib = Arc::new(Library::open(library::library_path(base)));
+                    println!("[client] library: {} tracks restored", lib.list().len());
+                    (store, lib)
                 }
-                Err(e) => {
-                    eprintln!("[client] no app data dir ({e}), using memory cache");
-                    Arc::new(ChunkStore::new())
+                None => {
+                    eprintln!("[client] no app data dir, using memory cache + library");
+                    (Arc::new(ChunkStore::new()), Arc::new(Library::new()))
                 }
             };
 
@@ -330,13 +402,18 @@ pub fn run() {
                 &store.owned_hashes(),
             );
 
-            app.manage(AppState {
+            let state = AppState {
                 peer_id,
                 chunk_addr,
                 store,
                 tracker,
                 stream_registry: Arc::new(Mutex::new(HashMap::new())),
-            });
+                lib,
+            };
+            // 启动时也检查一次容量 —— 上次运行可能在淘汰前就退出了。
+            state.enforce_cache_limit();
+
+            app.manage(state);
             Ok(())
         })
         .run(tauri::generate_context!())
