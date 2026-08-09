@@ -35,12 +35,14 @@ import {
   lookupTrack,
   downloadTrack,
   p2pStatus,
+  cacheStats,
   isTauri,
   makeTrackUri,
   parseTrackInput,
   type TrackManifest,
   type P2pStatus,
   type SharedTrack,
+  type CacheStats,
 } from "@/lib/api";
 
 type Track = {
@@ -77,6 +79,7 @@ function App() {
   const [tracks, setTracks] = useState<Track[]>(DEMO_TRACKS);
   const [current, setCurrent] = useState<Track | null>(null);
   const [status, setStatus] = useState<P2pStatus | null>(null);
+  const [cache, setCache] = useState<CacheStats | null>(null);
   const [shared, setShared] = useState<SharedTrack[]>([]);
   const [view, setView] = useState<View>("library");
   /** 正在下载的 track_hash 集合。 */
@@ -88,11 +91,14 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const nextId = useRef(100);
 
-  // 轮询 P2P 状态。
+  // 轮询 P2P 状态与本地缓存占用。
   useEffect(() => {
     if (!isTauri()) return;
     let alive = true;
-    const tick = () => p2pStatus().then((s) => alive && setStatus(s)).catch(() => {});
+    const tick = () => {
+      p2pStatus().then((s) => alive && setStatus(s)).catch(() => {});
+      cacheStats().then((c) => alive && setCache(c)).catch(() => {});
+    };
     tick();
     const timer = setInterval(tick, 2000);
     return () => {
@@ -384,6 +390,9 @@ function App() {
                   </span>
                 </div>
                 <StatusRow label="本地分片" value={`${status.owned_chunks}`} />
+                {cache && (
+                  <StatusRow label="缓存占用" value={fmtBytes(cache.bytes)} />
+                )}
                 <div className="truncate pt-1 text-[10px] text-muted-foreground/70">
                   peer: {status.peer_id.slice(0, 8)}… @ {status.chunk_addr}
                 </div>

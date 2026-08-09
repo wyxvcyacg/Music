@@ -6,7 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// 默认分片大小：256 KiB。流媒体场景下小分片利于快速起播与多源调度。
@@ -37,26 +39,60 @@ pub struct TrackManifest {
 ///
 /// 既是本地缓存（自己下载/导入的分片），也是对外分发的来源
 /// —— 别的节点可以来拉取 `store` 里已有的分片。
+///
+/// 两种模式：
+///   - `new()`   纯内存，进程退出即丢（测试用）
+///   - `open(d)` 磁盘持久化：分片按内容哈希存为文件，跨重启保留，
+///               内存里只保留"持有哪些 hash"的索引，不驻留分片内容。
 pub struct ChunkStore {
-    chunks: Mutex<HashMap<String, Vec<u8>>>,
+    /// Some = 磁盘模式的根目录；None = 纯内存模式。
+    dir: Option<PathBuf>,
+    /// 持有哪些分片哈希。磁盘模式下这是唯一的内存开销。
+    index: Mutex<HashSet<String>>,
+    /// 仅内存模式使用。
+    mem: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl ChunkStore {
+    /// 纯内存 store（进程退出即丢）。
     pub fn new() -> Self {
         Self {
-            chunks: Mutex::new(HashMap::new()),
+            dir: None,
+            index: Mutex::new(HashSet::new()),
+            mem: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 打开磁盘持久化 store。目录不存在会创建；已有分片会被扫描进索引。
+    ///
+    /// 布局：`<dir>/<hash前2位>/<完整hash>`，两级目录避免单目录堆积几万文件。
+    pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let dir = dir.into();
+        fs::create_dir_all(&dir)?;
+        let index = Mutex::new(scan_existing(&dir));
+        Ok(Self {
+            dir: Some(dir),
+            index,
+            mem: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// 分片在磁盘上的路径。
+    fn path_for(&self, dir: &Path, hash: &str) -> PathBuf {
+        // hash 是 64 位小写 hex，取前 2 位做子目录。
+        let (prefix, _) = hash.split_at(2.min(hash.len()));
+        dir.join(prefix).join(hash)
     }
 
     /// 导入一整首曲目：切片、对每片算哈希、存入 store，返回清单。
     pub fn import_track(&self, data: &[u8]) -> TrackManifest {
-        let mut store = self.chunks.lock().unwrap();
         let mut chunk_hashes = Vec::new();
-
         for chunk in data.chunks(CHUNK_SIZE) {
             let h = hash_bytes(chunk);
             // 已存在则跳过写入（去重），但仍要记入清单以保证顺序完整。
-            store.entry(h.clone()).or_insert_with(|| chunk.to_vec());
+            if !self.has(&h) {
+                self.write_chunk(&h, chunk);
+            }
             chunk_hashes.push(h);
         }
 
@@ -68,40 +104,101 @@ impl ChunkStore {
         }
     }
 
-    /// 是否持有某个分片。
+    /// 是否持有某个分片。只查内存索引，不碰磁盘。
     pub fn has(&self, hash: &str) -> bool {
-        self.chunks.lock().unwrap().contains_key(hash)
+        self.index.lock().unwrap().contains(hash)
     }
 
-    /// 读取一个分片。阶段二：响应其他节点的分片拉取请求。
-    #[allow(dead_code)]
+    /// 读取一个分片。响应其他节点的分片拉取请求，以及本地重组/区间读取。
     pub fn get(&self, hash: &str) -> Option<Vec<u8>> {
-        self.chunks.lock().unwrap().get(hash).cloned()
+        if !self.has(hash) {
+            return None;
+        }
+        match &self.dir {
+            Some(dir) => fs::read(self.path_for(dir, hash)).ok(),
+            None => self.mem.lock().unwrap().get(hash).cloned(),
+        }
     }
 
     /// 写入一个分片。校验内容哈希与声称的 hash 一致，防止被污染的数据混入。
-    /// 返回是否写入成功（哈希不匹配则拒绝）。阶段二：接收从其他节点下载的分片。
-    #[allow(dead_code)]
+    /// 返回是否写入成功（哈希不匹配则拒绝）。
     pub fn put(&self, hash: &str, data: Vec<u8>) -> bool {
         if hash_bytes(&data) != hash {
             return false;
         }
-        self.chunks.lock().unwrap().insert(hash.to_string(), data);
+        self.write_chunk(hash, &data);
         true
+    }
+
+    /// 实际落盘/入内存 + 更新索引。调用方须已校验哈希。
+    fn write_chunk(&self, hash: &str, data: &[u8]) {
+        match &self.dir {
+            Some(dir) => {
+                let path = self.path_for(dir, hash);
+                if let Some(parent) = path.parent() {
+                    if fs::create_dir_all(parent).is_err() {
+                        return;
+                    }
+                }
+                // 原子写：先写临时文件再 rename，避免崩溃留下半截文件
+                // 被后续扫描当成有效分片。
+                let tmp = path.with_extension("tmp");
+                if fs::write(&tmp, data).is_err() {
+                    return;
+                }
+                if fs::rename(&tmp, &path).is_err() {
+                    let _ = fs::remove_file(&tmp);
+                    return;
+                }
+            }
+            None => {
+                self.mem
+                    .lock()
+                    .unwrap()
+                    .insert(hash.to_string(), data.to_vec());
+            }
+        }
+        self.index.lock().unwrap().insert(hash.to_string());
     }
 
     /// 当前持有的所有分片哈希（供向 Tracker 注册"我有哪些分片"）。
     pub fn owned_hashes(&self) -> Vec<String> {
-        self.chunks.lock().unwrap().keys().cloned().collect()
+        self.index.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// 持有的分片数量。比 `owned_hashes().len()` 便宜 —— 状态轮询用这个，
+    /// 避免每次克隆几千个字符串。
+    pub fn chunk_count(&self) -> usize {
+        self.index.lock().unwrap().len()
+    }
+
+    /// 缓存占用的字节数（磁盘模式统计文件大小；内存模式统计内容长度）。
+    pub fn cache_bytes(&self) -> u64 {
+        match &self.dir {
+            Some(dir) => {
+                let hashes = self.owned_hashes();
+                hashes
+                    .iter()
+                    .filter_map(|h| fs::metadata(self.path_for(dir, h)).ok())
+                    .map(|m| m.len())
+                    .sum()
+            }
+            None => self
+                .mem
+                .lock()
+                .unwrap()
+                .values()
+                .map(|v| v.len() as u64)
+                .sum(),
+        }
     }
 
     /// 按清单重组出完整曲目。缺任何一片则返回 Err(缺失的哈希)。
     pub fn reassemble(&self, manifest: &TrackManifest) -> Result<Vec<u8>, String> {
-        let store = self.chunks.lock().unwrap();
         let mut out = Vec::with_capacity(manifest.total_size);
         for h in &manifest.chunks {
-            match store.get(h) {
-                Some(bytes) => out.extend_from_slice(bytes),
+            match self.get(h) {
+                Some(bytes) => out.extend_from_slice(&bytes),
                 None => return Err(format!("missing chunk: {h}")),
             }
         }
@@ -121,7 +218,6 @@ impl ChunkStore {
         if start >= manifest.total_size || end <= start {
             return Ok(Vec::new());
         }
-        let store = self.chunks.lock().unwrap();
         let cs = manifest.chunk_size;
         let mut out = Vec::with_capacity(end - start);
         let mut pos = start;
@@ -131,7 +227,7 @@ impl ChunkStore {
                 .chunks
                 .get(idx)
                 .ok_or_else(|| format!("range out of bounds: chunk index {idx}"))?;
-            let chunk = store
+            let chunk = self
                 .get(hash)
                 .ok_or_else(|| format!("missing chunk: {hash}"))?;
             let off = pos - idx * cs; // 分片内偏移
@@ -141,6 +237,38 @@ impl ChunkStore {
         }
         Ok(out)
     }
+}
+
+/// 扫描已有分片目录，重建"持有哪些 hash"的索引。
+///
+/// 只认文件名本身就是合法 64 位 hex 的文件 —— 这样残留的 `.tmp`
+/// 半截文件会被自动忽略，不会被当成有效分片。
+fn scan_existing(dir: &Path) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let subdirs = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return set,
+    };
+    for sub in subdirs.flatten() {
+        if !sub.path().is_dir() {
+            continue;
+        }
+        if let Ok(files) = fs::read_dir(sub.path()) {
+            for f in files.flatten() {
+                if let Some(name) = f.file_name().to_str() {
+                    if is_chunk_hash(name) {
+                        set.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    set
+}
+
+/// 文件名是否是合法的分片哈希（64 位小写 hex）。
+fn is_chunk_hash(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// 计算 [start, start+len) 区间覆盖的分片下标（含端点）。纯函数，便于测试。
@@ -167,6 +295,108 @@ impl Default for ChunkStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 建一个本次测试专属的临时目录（无需外部 crate）。
+    fn temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("music_test_{tag}_{pid}_{n}"));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn disk_store_persists_across_reopen() {
+        let dir = temp_dir("persist");
+
+        let payload = b"chunk that must survive a restart".to_vec();
+        let h = hash_bytes(&payload);
+
+        // 第一次打开：写入一个分片。
+        {
+            let store = ChunkStore::open(&dir).unwrap();
+            assert!(store.put(&h, payload.clone()));
+            assert!(store.has(&h));
+            assert_eq!(store.chunk_count(), 1);
+        } // store 离开作用域，模拟进程退出
+
+        // 重新打开同一目录：分片应仍在，内容一致。
+        {
+            let reopened = ChunkStore::open(&dir).unwrap();
+            assert!(reopened.has(&h), "chunk lost across reopen");
+            assert_eq!(reopened.get(&h).unwrap(), payload);
+            assert_eq!(reopened.chunk_count(), 1);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_store_import_and_read_range() {
+        let dir = temp_dir("range");
+        let store = ChunkStore::open(&dir).unwrap();
+
+        // 跨多个分片的数据，走完整 import -> reassemble -> read_range 路径。
+        let data: Vec<u8> = (0..(CHUNK_SIZE + 5000)).map(|i| (i % 251) as u8).collect();
+        let manifest = store.import_track(&data);
+        assert_eq!(manifest.chunks.len(), 2);
+
+        assert_eq!(store.reassemble(&manifest).unwrap(), data);
+
+        // 跨分片边界读一段。
+        let start = CHUNK_SIZE - 50;
+        let got = store.read_range(&manifest, start, 100).unwrap();
+        assert_eq!(got, &data[start..start + 100]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_ignores_non_hash_files() {
+        let dir = temp_dir("scan");
+        fs::create_dir_all(dir.join("ab")).unwrap();
+        // 残留的 .tmp（崩溃留下的半截文件）与其它杂项都不该被当成分片。
+        fs::write(dir.join("ab").join("not-a-hash"), b"junk").unwrap();
+        fs::write(dir.join("ab").join("abcd.tmp"), b"partial").unwrap();
+        // 一个合法的 64 位 hex 文件名应被识别。
+        let valid = "a".repeat(64);
+        fs::write(dir.join("ab").join(&valid), b"x").unwrap();
+
+        let store = ChunkStore::open(&dir).unwrap();
+        assert_eq!(store.chunk_count(), 1, "only the valid hash should load");
+        assert!(store.has(&valid));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_store_rejects_tampered_put() {
+        let dir = temp_dir("tamper");
+        let store = ChunkStore::open(&dir).unwrap();
+
+        let good = b"authentic bytes".to_vec();
+        let h = hash_bytes(&good);
+        // 用真 hash 配假数据 —— 磁盘模式下同样必须拒绝，且不留下文件。
+        assert!(!store.put(&h, b"tampered".to_vec()));
+        assert!(!store.has(&h));
+        assert_eq!(store.chunk_count(), 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_bytes_reports_size() {
+        let dir = temp_dir("size");
+        let store = ChunkStore::open(&dir).unwrap();
+        let payload = vec![7u8; 4096];
+        let h = hash_bytes(&payload);
+        store.put(&h, payload);
+        assert_eq!(store.cache_bytes(), 4096);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn import_and_reassemble_roundtrip() {

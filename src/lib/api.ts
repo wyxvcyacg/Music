@@ -125,3 +125,14 @@ export async function hasChunk(chunkHash: string): Promise<boolean> {
 export async function p2pStatus(): Promise<P2pStatus> {
   return invoke<P2pStatus>("p2p_status");
 }
+
+/** 与 Rust lib.rs 的 CacheStats 对应 —— 本地分片缓存统计。 */
+export type CacheStats = {
+  chunks: number;
+  bytes: number;
+};
+
+/** 本地分片缓存统计（磁盘占用）。 */
+export async function cacheStats(): Promise<CacheStats> {
+  return invoke<CacheStats>("cache_stats");
+}

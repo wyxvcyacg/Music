@@ -211,45 +211,49 @@ fn p2p_status(state: State<AppState>) -> P2pStatus {
         peer_id: state.peer_id.clone(),
         chunk_addr: state.chunk_addr.clone(),
         tracker_online,
-        owned_chunks: state.store.owned_hashes().len(),
+        // 用 chunk_count 而非 owned_hashes().len()：这个命令每 2 秒被轮询一次，
+        // 不该每次都克隆全部哈希字符串。
+        owned_chunks: state.store.chunk_count(),
+    }
+}
+
+/// 本地分片缓存统计（供 UI 展示占用）。
+#[derive(serde::Serialize)]
+struct CacheStats {
+    chunks: usize,
+    bytes: u64,
+}
+
+#[tauri::command]
+fn cache_stats(state: State<AppState>) -> CacheStats {
+    CacheStats {
+        chunks: state.store.chunk_count(),
+        bytes: state.store.cache_bytes(),
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let peer_id = Uuid::new_v4().to_string();
-    let store = Arc::new(ChunkStore::new());
-
-    // 后台启动分片服务，拿到本节点对外地址。
-    let chunk_addr = transfer::start_chunk_server(Arc::clone(&store))
-        .expect("failed to start chunk server");
-    println!("[client] peer_id={peer_id} chunk_addr={chunk_addr}");
-
-    // 连接 Tracker 并注册自己（此刻还没有分片）。
-    let tracker = Arc::new(RemoteTracker::new(tracker::TRACKER_ADDR));
-    tracker.register(
-        PeerInfo {
-            peer_id: peer_id.clone(),
-            addr: chunk_addr.clone(),
-        },
-        &[],
-    );
-
-    let state = AppState {
-        peer_id,
-        chunk_addr,
-        store,
-        tracker,
-        stream_registry: Arc::new(Mutex::new(HashMap::new())),
-    };
-    // 协议处理器需要的共享句柄（在 build 前克隆出来 move 进闭包）。
-    let stream_ctx = state.stream_ctx();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .register_asynchronous_uri_scheme_protocol("stream", move |_ctx, request, responder| {
-            let sc = stream_ctx.clone();
+        .register_asynchronous_uri_scheme_protocol("stream", |ctx, request, responder| {
+            // 在请求时从 AppHandle 取状态 —— 这样 store 可以在 setup() 里
+            // 用 app_data_dir() 打开磁盘模式，而不必在 Builder 之前就构造。
+            let app = ctx.app_handle().clone();
             std::thread::spawn(move || {
+                let sc = match app.try_state::<AppState>() {
+                    Some(state) => state.stream_ctx(),
+                    None => {
+                        // 理论上不会发生（setup 先于窗口加载），保险起见回 503。
+                        let resp = tauri::http::Response::builder()
+                            .status(503)
+                            .body(b"state not ready".to_vec());
+                        if let Ok(r) = resp {
+                            responder.respond(r);
+                        }
+                        return;
+                    }
+                };
                 let path = request.uri().path().to_string();
                 let range = request
                     .headers()
@@ -269,7 +273,6 @@ pub fn run() {
                 }
             });
         })
-        .manage(state)
         .invoke_handler(tauri::generate_handler![
             import_track,
             prepare_stream,
@@ -280,9 +283,60 @@ pub fn run() {
             has_chunk,
             reassemble,
             p2p_status,
+            cache_stats,
         ])
         .setup(|app| {
-            let _ = app.state::<AppState>();
+            let peer_id = Uuid::new_v4().to_string();
+
+            // 分片缓存：优先磁盘持久化（跨重启保留，也能继续给别人供片）。
+            // 拿不到目录或打不开就回退到内存模式，不影响可用性。
+            let store = match app.path().app_data_dir() {
+                Ok(base) => {
+                    let dir = base.join("chunks");
+                    match ChunkStore::open(&dir) {
+                        Ok(s) => {
+                            println!(
+                                "[client] chunk cache: {} ({} chunks restored)",
+                                dir.display(),
+                                s.chunk_count()
+                            );
+                            Arc::new(s)
+                        }
+                        Err(e) => {
+                            eprintln!("[client] disk cache unavailable ({e}), using memory");
+                            Arc::new(ChunkStore::new())
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[client] no app data dir ({e}), using memory cache");
+                    Arc::new(ChunkStore::new())
+                }
+            };
+
+            // 后台启动分片服务，拿到本节点对外地址。
+            let chunk_addr = transfer::start_chunk_server(Arc::clone(&store))
+                .expect("failed to start chunk server");
+            println!("[client] peer_id={peer_id} chunk_addr={chunk_addr}");
+
+            // 连接 Tracker 并注册自己，连同已恢复的分片一起宣告
+            // —— 重启后立刻能继续为这些分片供源。
+            let tracker = Arc::new(RemoteTracker::new(tracker::TRACKER_ADDR));
+            tracker.register(
+                PeerInfo {
+                    peer_id: peer_id.clone(),
+                    addr: chunk_addr.clone(),
+                },
+                &store.owned_hashes(),
+            );
+
+            app.manage(AppState {
+                peer_id,
+                chunk_addr,
+                store,
+                tracker,
+                stream_registry: Arc::new(Mutex::new(HashMap::new())),
+            });
             Ok(())
         })
         .run(tauri::generate_context!())

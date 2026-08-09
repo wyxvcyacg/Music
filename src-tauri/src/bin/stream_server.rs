@@ -32,9 +32,25 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--import")
         .map(|w| PathBuf::from(&w[1]));
+    // --data-dir <path>：用磁盘持久化缓存（可验证跨重启供片）。
+    let data_dir: Option<PathBuf> = args
+        .windows(2)
+        .find(|w| w[0] == "--data-dir")
+        .map(|w| PathBuf::from(&w[1]));
 
     let peer_id = uuid::Uuid::new_v4().to_string();
-    let store = Arc::new(ChunkStore::new());
+    let store = Arc::new(match &data_dir {
+        Some(d) => {
+            let s = ChunkStore::open(d).expect("open disk chunk store");
+            println!(
+                "[stream_server] disk cache {} ({} chunks restored)",
+                d.display(),
+                s.chunk_count()
+            );
+            s
+        }
+        None => ChunkStore::new(),
+    });
 
     // 开启分片服务（让别人能从本节点拉分片）
     let chunk_addr = music_lib::transfer::start_chunk_server(Arc::clone(&store))
