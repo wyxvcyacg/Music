@@ -6,6 +6,7 @@
 //!
 //! 协议：一问一答的短连接，请求与响应都是单行 JSON + '\n'。
 
+use crate::accounts::Accounts;
 use crate::chunk::TrackManifest;
 use crate::peer::{InMemoryTracker, PeerDiscovery, PeerInfo};
 use serde::{Deserialize, Serialize};
@@ -28,13 +29,31 @@ pub enum TrackerRequest {
     /// 查询谁持有某分片。
     Find { chunk: String },
     /// 发布一首曲目（连同清单），让别的节点能发现并下载。
-    Publish { manifest: TrackManifest, title: String, artist: String, #[serde(default)] mime: String },
+    /// 需要有效 token —— 发布是唯一需要登录的操作（阶段三）。
+    Publish {
+        manifest: TrackManifest,
+        title: String,
+        artist: String,
+        #[serde(default)]
+        mime: String,
+        #[serde(default)]
+        token: String,
+    },
     /// 列出所有已发布曲目。
     List,
     /// 按 track_hash 查询单个共享曲目（用于"粘贴链接→播放"流程）。
     Get { track_hash: String },
     /// 节点下线。
     Unregister { peer_id: String },
+    /// 注册新账号（阶段三）。成功即登录，返回 token。
+    RegisterAccount { username: String, password: String },
+    /// 登录，返回 token。
+    Login { username: String, password: String },
+    /// 登出，吊销 token。
+    Logout { token: String },
+    /// 用 token 查询当前身份。
+    #[serde(rename = "whoami")]
+    WhoAmI { token: String },
 }
 
 /// Tracker → 客户端的响应。
@@ -45,6 +64,10 @@ pub enum TrackerResponse {
     Peers { peers: Vec<PeerInfo> },
     Manifests { items: Vec<SharedTrack> },
     Track { item: Option<SharedTrack> },
+    /// 登录/注册成功。
+    Auth { token: String, username: String },
+    /// whoami 结果；未登录或 token 失效时 username 为 None。
+    Identity { username: Option<String> },
     Error { message: String },
 }
 
@@ -57,13 +80,21 @@ pub struct SharedTrack {
     /// 媒体 MIME 类型（如 audio/mpeg），供流式播放设置 Content-Type。
     #[serde(default)]
     pub mime: String,
+    /// 发布者用户名（阶段三）。老数据可能没有，故 default。
+    #[serde(default)]
+    pub publisher: String,
 }
 
 /// 已发布曲目表：track_hash -> SharedTrack。
 type ManifestStore = Arc<Mutex<HashMap<String, SharedTrack>>>;
 
 /// 处理单个请求，返回响应。
-fn handle(req: TrackerRequest, tracker: &InMemoryTracker, manifests: &ManifestStore) -> TrackerResponse {
+fn handle(
+    req: TrackerRequest,
+    tracker: &InMemoryTracker,
+    manifests: &ManifestStore,
+    accounts: &Accounts,
+) -> TrackerResponse {
     match req {
         TrackerRequest::Register { peer, chunks } => {
             tracker.register(peer, &chunks);
@@ -76,10 +107,17 @@ fn handle(req: TrackerRequest, tracker: &InMemoryTracker, manifests: &ManifestSt
         TrackerRequest::Find { chunk } => TrackerResponse::Peers {
             peers: tracker.find_peers(&chunk),
         },
-        TrackerRequest::Publish { manifest, title, artist, mime } => {
+        TrackerRequest::Publish { manifest, title, artist, mime, token } => {
+            // 发布需要登录 —— 这是唯一鉴权的操作。浏览/下载/播放保持开放，
+            // 以维持 P2P "人越多越流畅"的性质。
+            let Some(publisher) = accounts.verify(&token) else {
+                return TrackerResponse::Error {
+                    message: "发布需要先登录".into(),
+                };
+            };
             manifests.lock().unwrap().insert(
                 manifest.track_hash.clone(),
-                SharedTrack { manifest, title, artist, mime },
+                SharedTrack { manifest, title, artist, mime, publisher },
             );
             TrackerResponse::Ok
         }
@@ -93,11 +131,41 @@ fn handle(req: TrackerRequest, tracker: &InMemoryTracker, manifests: &ManifestSt
             tracker.unregister(&peer_id);
             TrackerResponse::Ok
         }
+        TrackerRequest::RegisterAccount { username, password } => {
+            match accounts.register(&username, &password) {
+                Ok(auth) => TrackerResponse::Auth {
+                    token: auth.token,
+                    username: auth.username,
+                },
+                Err(message) => TrackerResponse::Error { message },
+            }
+        }
+        TrackerRequest::Login { username, password } => {
+            match accounts.login(&username, &password) {
+                Ok(auth) => TrackerResponse::Auth {
+                    token: auth.token,
+                    username: auth.username,
+                },
+                Err(message) => TrackerResponse::Error { message },
+            }
+        }
+        TrackerRequest::Logout { token } => {
+            accounts.logout(&token);
+            TrackerResponse::Ok
+        }
+        TrackerRequest::WhoAmI { token } => TrackerResponse::Identity {
+            username: accounts.verify(&token),
+        },
     }
 }
 
 /// 处理一个客户端连接：读一行 JSON 请求，回一行 JSON 响应。
-fn serve_conn(stream: TcpStream, tracker: Arc<InMemoryTracker>, manifests: ManifestStore) {
+fn serve_conn(
+    stream: TcpStream,
+    tracker: Arc<InMemoryTracker>,
+    manifests: ManifestStore,
+    accounts: Arc<Accounts>,
+) {
     let peer = stream.peer_addr().ok();
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
@@ -111,7 +179,7 @@ fn serve_conn(stream: TcpStream, tracker: Arc<InMemoryTracker>, manifests: Manif
     }
 
     let resp = match serde_json::from_str::<TrackerRequest>(line.trim()) {
-        Ok(req) => handle(req, &tracker, &manifests),
+        Ok(req) => handle(req, &tracker, &manifests, &accounts),
         Err(e) => TrackerResponse::Error {
             message: format!("bad request: {e}"),
         },
@@ -126,19 +194,46 @@ fn serve_conn(stream: TcpStream, tracker: Arc<InMemoryTracker>, manifests: Manif
 }
 
 /// 阻塞运行 Tracker 服务（`--tracker` 模式的入口）。
+///
+/// `data_dir` 用于持久化账号；None 表示账号只存在内存（进程退出即丢）。
 pub fn run_tracker(addr: &str) -> std::io::Result<()> {
+    run_tracker_with_data_dir(addr, None)
+}
+
+/// 同 `run_tracker`，但可指定账号持久化目录。
+pub fn run_tracker_with_data_dir(
+    addr: &str,
+    data_dir: Option<std::path::PathBuf>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     println!("[tracker] listening on {addr}");
 
     let tracker = Arc::new(InMemoryTracker::new());
     let manifests: ManifestStore = Arc::new(Mutex::new(HashMap::new()));
+    let accounts = Arc::new(match &data_dir {
+        Some(dir) => {
+            let path = dir.join(crate::accounts::ACCOUNTS_FILE);
+            let a = Accounts::open(&path);
+            println!(
+                "[tracker] accounts: {} ({} registered)",
+                path.display(),
+                a.account_count()
+            );
+            a
+        }
+        None => {
+            println!("[tracker] accounts: in-memory (not persisted)");
+            Accounts::new()
+        }
+    });
 
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
                 let tracker = Arc::clone(&tracker);
                 let manifests = Arc::clone(&manifests);
-                std::thread::spawn(move || serve_conn(s, tracker, manifests));
+                let accounts = Arc::clone(&accounts);
+                std::thread::spawn(move || serve_conn(s, tracker, manifests, accounts));
             }
             Err(e) => eprintln!("[tracker] accept error: {e}"),
         }

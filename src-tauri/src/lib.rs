@@ -10,6 +10,7 @@
 //!
 //! 账号系统留到阶段三，这里只有 peer_id，没有 user_id。
 
+pub mod accounts;
 pub mod chunk;
 pub mod library;
 pub mod peer;
@@ -17,11 +18,12 @@ pub mod stream;
 pub mod tracker;
 pub mod transfer;
 
-pub use tracker::{run_tracker, TRACKER_ADDR};
+pub use tracker::{run_tracker, run_tracker_with_data_dir, TRACKER_ADDR};
 
 use chunk::{ChunkStore, TrackManifest};
 use library::{Library, LibraryTrack};
 use peer::{PeerDiscovery, PeerInfo, RemoteTracker};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use stream::{StreamCtx, StreamEntry};
@@ -43,6 +45,18 @@ struct AppState {
     stream_registry: Arc<Mutex<HashMap<String, StreamEntry>>>,
     /// 持久化的本地曲库 —— 同时定义了缓存淘汰的"受保护"分片集合。
     lib: Arc<Library>,
+    /// 当前登录会话（阶段三）。与 `peer_id` **并存且互不干扰** ——
+    /// 铁律之一的落地：登出/换账号都不影响 P2P 传输。
+    session: Mutex<Option<Session>>,
+    /// session.json 路径；None 表示不持久化。
+    session_path: Option<std::path::PathBuf>,
+}
+
+/// 一次登录会话。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Session {
+    token: String,
+    username: String,
 }
 
 impl AppState {
@@ -68,6 +82,38 @@ impl AppState {
                 "[cache] evicted {} chunks, freed {} bytes ({} -> {})",
                 report.evicted, report.bytes_freed, report.bytes_before, report.bytes_after
             );
+        }
+    }
+
+    /// 当前 token（未登录则为空串）。
+    fn token(&self) -> String {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.token.clone())
+            .unwrap_or_default()
+    }
+
+    /// 设置或清除会话，并持久化。
+    fn set_session(&self, next: Option<Session>) {
+        *self.session.lock().unwrap() = next.clone();
+        let Some(path) = &self.session_path else { return };
+        match &next {
+            Some(s) => {
+                if let Ok(json) = serde_json::to_string_pretty(s) {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let tmp = path.with_extension("json.tmp");
+                    if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, path).is_err() {
+                        let _ = std::fs::remove_file(&tmp);
+                    }
+                }
+            }
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -131,6 +177,7 @@ fn prepare_stream(state: State<AppState>, manifest: TrackManifest, mime: String)
 }
 
 /// 发布一首曲目到共享曲库，让别的节点能发现并下载/流式播放。
+/// 需要先登录 —— 发布是唯一鉴权的操作。
 #[tauri::command]
 fn publish_track(
     state: State<AppState>,
@@ -139,16 +186,99 @@ fn publish_track(
     artist: String,
     mime: String,
 ) -> Result<(), String> {
+    let token = state.token();
+    if token.is_empty() {
+        return Err("发布需要先登录".into());
+    }
     // 确保分片已在本地并向 Tracker 宣告（发布者即首个种子）。
     state.tracker.announce(&state.peer_id, &manifest.chunks);
-    match state
-        .tracker
-        .request(&TrackerRequest::Publish { manifest, title, artist, mime })
-    {
+    match state.tracker.request(&TrackerRequest::Publish {
+        manifest,
+        title,
+        artist,
+        mime,
+        token,
+    }) {
         Ok(TrackerResponse::Ok) => Ok(()),
+        Ok(TrackerResponse::Error { message }) => Err(message),
         Ok(other) => Err(format!("unexpected response: {other:?}")),
         Err(e) => Err(e),
     }
+}
+
+/// 当前登录用户名；未登录返回 None。
+#[tauri::command]
+fn current_user(state: State<AppState>) -> Option<String> {
+    let session = state.session.lock().unwrap().clone();
+    let Some(s) = session else { return None };
+    // 向 Tracker 确认 token 还有效（它可能已重启或 token 已过期）。
+    match state.tracker.request(&TrackerRequest::WhoAmI {
+        token: s.token.clone(),
+    }) {
+        Ok(TrackerResponse::Identity { username: Some(u) }) => Some(u),
+        Ok(TrackerResponse::Identity { username: None }) => {
+            // token 失效 —— 清掉本地会话，让用户重新登录。
+            state.set_session(None);
+            None
+        }
+        // Tracker 不可达时保留本地会话，不因网络抖动把人登出。
+        _ => Some(s.username),
+    }
+}
+
+/// 注册新账号（成功即登录）。
+#[tauri::command]
+fn register_account(
+    state: State<AppState>,
+    username: String,
+    password: String,
+) -> Result<String, String> {
+    match state
+        .tracker
+        .request(&TrackerRequest::RegisterAccount { username, password })
+    {
+        Ok(TrackerResponse::Auth { token, username }) => {
+            state.set_session(Some(Session {
+                token,
+                username: username.clone(),
+            }));
+            Ok(username)
+        }
+        Ok(TrackerResponse::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected response: {other:?}")),
+        Err(e) => Err(e),
+    }
+}
+
+/// 登录。
+#[tauri::command]
+fn login(state: State<AppState>, username: String, password: String) -> Result<String, String> {
+    match state
+        .tracker
+        .request(&TrackerRequest::Login { username, password })
+    {
+        Ok(TrackerResponse::Auth { token, username }) => {
+            state.set_session(Some(Session {
+                token,
+                username: username.clone(),
+            }));
+            Ok(username)
+        }
+        Ok(TrackerResponse::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected response: {other:?}")),
+        Err(e) => Err(e),
+    }
+}
+
+/// 登出：吊销 Tracker 侧 token 并清空本地会话。
+/// 注意这**完全不影响 P2P 传输** —— peer_id 与分片供源照常（铁律之一）。
+#[tauri::command]
+fn logout(state: State<AppState>) {
+    let token = state.token();
+    if !token.is_empty() {
+        let _ = state.tracker.request(&TrackerRequest::Logout { token });
+    }
+    state.set_session(None);
 }
 
 /// 列出 Tracker 上所有已发布的共享曲目。
@@ -352,6 +482,10 @@ pub fn run() {
             cache_stats,
             list_library,
             remove_from_library,
+            current_user,
+            register_account,
+            login,
+            logout,
         ])
         .setup(|app| {
             let peer_id = Uuid::new_v4().to_string();
@@ -402,6 +536,16 @@ pub fn run() {
                 &store.owned_hashes(),
             );
 
+            // 恢复上次的登录会话（token 可能已失效，current_user 会校验）。
+            let session_path = data_dir.as_ref().map(|d| d.join("session.json"));
+            let session = session_path
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|t| serde_json::from_str::<Session>(&t).ok());
+            if let Some(s) = &session {
+                println!("[client] restored session for {}", s.username);
+            }
+
             let state = AppState {
                 peer_id,
                 chunk_addr,
@@ -409,6 +553,8 @@ pub fn run() {
                 tracker,
                 stream_registry: Arc::new(Mutex::new(HashMap::new())),
                 lib,
+                session: Mutex::new(session),
+                session_path,
             };
             // 启动时也检查一次容量 —— 上次运行可能在淘汰前就退出了。
             state.enforce_cache_limit();

@@ -14,7 +14,16 @@ fn main() {
             .cloned()
             .unwrap_or_else(|| music_lib::TRACKER_ADDR.to_string());
 
-        if let Err(e) = music_lib::run_tracker(&addr) {
+        // 账号持久化目录：--data-dir <path>，默认当前目录。
+        let data_dir = args
+            .iter()
+            .position(|a| a == "--data-dir")
+            .and_then(|i| args.get(i + 1))
+            .filter(|a| !a.starts_with("--"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        if let Err(e) = music_lib::run_tracker_with_data_dir(&addr, Some(data_dir)) {
             eprintln!("[tracker] fatal: {e}");
             std::process::exit(1);
         }

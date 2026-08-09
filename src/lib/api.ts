@@ -22,7 +22,36 @@ export type SharedTrack = {
   title: string;
   artist: string;
   mime: string;
+  /** 发布者用户名（阶段三）。 */
+  publisher: string;
 };
+
+// ---- 账号（阶段三）----
+// 注意：节点身份（peer_id）与用户身份（username）是解耦的两层。
+// 登出不影响 P2P 传输 —— 分片照常供源。
+
+/** 当前登录用户名；未登录返回 null。 */
+export async function currentUser(): Promise<string | null> {
+  return invoke<string | null>("current_user");
+}
+
+/** 注册新账号（成功即登录），返回用户名。 */
+export async function registerAccount(
+  username: string,
+  password: string
+): Promise<string> {
+  return invoke<string>("register_account", { username, password });
+}
+
+/** 登录，返回用户名。 */
+export async function login(username: string, password: string): Promise<string> {
+  return invoke<string>("login", { username, password });
+}
+
+/** 登出（不影响 P2P 传输）。 */
+export async function logout(): Promise<void> {
+  return invoke("logout");
+}
 
 /** 与 Rust lib.rs 的 DownloadResult 对应。 */
 export type DownloadResult = {

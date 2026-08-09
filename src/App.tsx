@@ -23,6 +23,9 @@ import {
   Link as LinkIcon,
   ClipboardPaste,
   Trash2,
+  User,
+  LogIn,
+  LogOut,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -39,6 +42,10 @@ import {
   cacheStats,
   listLibrary,
   removeFromLibrary,
+  currentUser,
+  registerAccount,
+  login as apiLogin,
+  logout as apiLogout,
   isTauri,
   makeTrackUri,
   parseTrackInput,
@@ -93,6 +100,10 @@ function App() {
   const [pasteInput, setPasteInput] = useState("");
   /** 粘贴链接错误提示。 */
   const [pasteError, setPasteError] = useState<string | null>(null);
+  /** 当前登录用户名；null = 未登录。 */
+  const [user, setUser] = useState<string | null>(null);
+  /** 登录/注册对话框是否打开。 */
+  const [authOpen, setAuthOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const nextId = useRef(100);
 
@@ -145,6 +156,18 @@ function App() {
         console.error("restore library failed", e);
       }
     })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // 启动时确认登录状态（token 可能已过期或 Tracker 已重启）。
+  useEffect(() => {
+    if (!isTauri()) return;
+    let alive = true;
+    currentUser()
+      .then((u) => alive && setUser(u))
+      .catch(() => {});
     return () => {
       alive = false;
     };
@@ -225,16 +248,31 @@ function App() {
     }
   }
 
-  /** 发布一首已导入的曲目到共享曲库。 */
+  /** 发布一首已导入的曲目到共享曲库（需要登录）。 */
   async function onPublish(t: Track) {
     if (!t.manifest || !isTauri()) return;
+    if (!user) {
+      setAuthOpen(true);
+      return;
+    }
     try {
       await publishTrack(t.manifest, t.title, t.artist, t.mime || "audio/mpeg");
       patchTrack(t.id, { published: true });
       refreshShared();
     } catch (e) {
       console.error("publish failed", e);
+      alert(`发布失败：${e}`);
     }
+  }
+
+  /** 登出。不影响 P2P 传输 —— 分片照常供源（铁律之一）。 */
+  async function onLogout() {
+    try {
+      await apiLogout();
+    } catch (e) {
+      console.error("logout failed", e);
+    }
+    setUser(null);
   }
 
   /** 流式播放一首共享曲目（边下边播：分片按需从 peer 拉取）。 */
@@ -389,6 +427,36 @@ function App() {
             </div>
             <span className="text-lg font-semibold">Music</span>
           </div>
+
+          {/* 账号区（阶段三）。节点身份与用户身份解耦：登出不影响 P2P 传输。 */}
+          <div className="mb-3 rounded-md bg-secondary/40 px-2.5 py-2 text-xs">
+            {user ? (
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex min-w-0 items-center gap-1.5 text-foreground">
+                  <User className="size-3.5 shrink-0" />
+                  <span className="truncate font-medium">{user}</span>
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-6 shrink-0 text-muted-foreground"
+                  title="登出"
+                  onClick={onLogout}
+                >
+                  <LogOut className="size-3.5" />
+                </Button>
+              </div>
+            ) : (
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-7 w-full text-xs"
+                onClick={() => setAuthOpen(true)}
+              >
+                <LogIn className="size-3.5" /> 登录 / 注册
+              </Button>
+            )}
+          </div>
           <NavItem icon={<Search className="size-4" />} label="搜索" />
           <NavItem
             icon={<Library className="size-4" />}
@@ -486,6 +554,7 @@ function App() {
               onPublish={onPublish}
               onCopyLink={onCopyLink}
               onRemove={onRemove}
+              loggedIn={!!user}
               onImport={() => fileInputRef.current?.click()}
             />
           ) : (
@@ -581,6 +650,132 @@ function App() {
           </div>
         </div>
       </footer>
+
+      {authOpen && (
+        <AuthDialog
+          onClose={() => setAuthOpen(false)}
+          onSuccess={(username) => {
+            setUser(username);
+            setAuthOpen(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * 登录 / 注册对话框。
+ *
+ * 安全提示：Tracker 协议目前是明文 TCP，密码在传输中未加密 ——
+ * 仅适用于本机/局域网学习场景，公网部署必须套 TLS。
+ */
+function AuthDialog({
+  onClose,
+  onSuccess,
+}: {
+  onClose: () => void;
+  onSuccess: (username: string) => void;
+}) {
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    setError(null);
+    if (!username.trim() || !password) {
+      setError("请填写用户名和密码");
+      return;
+    }
+    setBusy(true);
+    try {
+      const name =
+        mode === "login"
+          ? await apiLogin(username.trim(), password)
+          : await registerAccount(username.trim(), password);
+      onSuccess(name);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-sm rounded-lg border border-border bg-card p-5 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* 模式切换 */}
+        <div className="mb-4 flex gap-1 rounded-md bg-secondary/50 p-1">
+          {(["login", "register"] as const).map((m) => (
+            <button
+              key={m}
+              onClick={() => {
+                setMode(m);
+                setError(null);
+              }}
+              className={cn(
+                "flex-1 rounded px-3 py-1.5 text-sm font-medium transition-colors",
+                mode === m
+                  ? "bg-background text-foreground"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              {m === "login" ? "登录" : "注册"}
+            </button>
+          ))}
+        </div>
+
+        <div className="space-y-3">
+          <div>
+            <label className="mb-1 block text-xs text-muted-foreground">用户名</label>
+            <input
+              autoFocus
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && void submit()}
+              className="w-full rounded border border-input bg-background px-2.5 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-muted-foreground">
+              密码{mode === "register" && "（至少 6 位）"}
+            </label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && void submit()}
+              className="w-full rounded border border-input bg-background px-2.5 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+            />
+          </div>
+
+          {error && <div className="text-xs text-destructive">{error}</div>}
+
+          <div className="flex gap-2 pt-1">
+            <Button className="flex-1" disabled={busy} onClick={() => void submit()}>
+              {busy && <Loader2 className="size-3.5 animate-spin" />}
+              {mode === "login" ? "登录" : "注册"}
+            </Button>
+            <Button variant="ghost" onClick={onClose}>
+              取消
+            </Button>
+          </div>
+
+          <p className="pt-1 text-[10px] leading-relaxed text-muted-foreground/70">
+            账号仅用于发布曲目。浏览、下载、播放无需登录。
+            <br />
+            当前 Tracker 为明文 TCP，请勿在公网使用真实密码。
+          </p>
+        </div>
+      </div>
     </div>
   );
 }
@@ -592,6 +787,7 @@ function LibraryView({
   onPublish,
   onCopyLink,
   onRemove,
+  loggedIn,
   onImport,
 }: {
   tracks: Track[];
@@ -600,6 +796,7 @@ function LibraryView({
   onPublish: (t: Track) => void;
   onCopyLink: (t: Track) => void;
   onRemove: (t: Track) => void;
+  loggedIn: boolean;
   onImport: () => void;
 }) {
   return (
@@ -700,6 +897,7 @@ function LibraryView({
                         <Button
                           variant="ghost"
                           size="sm"
+                          title={loggedIn ? "发布到共享曲库" : "发布需要先登录"}
                           onClick={(e) => {
                             e.stopPropagation();
                             onPublish(t);
@@ -785,6 +983,7 @@ function NetworkView({
               <tr>
                 <th className="px-4 py-2.5">标题</th>
                 <th className="px-4 py-2.5">艺术家</th>
+                <th className="px-4 py-2.5">发布者</th>
                 <th className="px-4 py-2.5">
                   <span className="flex items-center gap-1">
                     <Boxes className="size-3.5" /> 分片
@@ -802,6 +1001,16 @@ function NetworkView({
                   <tr key={s.manifest.track_hash} className="border-t border-border">
                     <td className="px-4 py-3 font-medium">{s.title}</td>
                     <td className="px-4 py-3 text-muted-foreground">{s.artist}</td>
+                    <td className="px-4 py-3 text-muted-foreground">
+                      {s.publisher ? (
+                        <span className="inline-flex items-center gap-1">
+                          <User className="size-3" />
+                          {s.publisher}
+                        </span>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
                     <td className="px-4 py-3 tabular-nums text-muted-foreground">
                       {s.manifest.chunks.length}
                     </td>
