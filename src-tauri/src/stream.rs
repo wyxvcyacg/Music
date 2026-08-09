@@ -8,7 +8,7 @@
 //! 且播放条的"已缓冲"底层会自动反映真实的渐进缓冲。
 
 use crate::chunk::ChunkStore;
-use crate::peer::{PeerDiscovery, PeerInfo, RemoteTracker};
+use crate::peer::{PeerDiscovery, RemoteTracker};
 use crate::chunk::TrackManifest;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -60,7 +60,10 @@ fn parse_range(header: &str, total: usize) -> Option<(usize, Option<usize>)> {
     Some((start, end))
 }
 
-/// 确保 [start, end] 覆盖的分片都在本地；缺的按需从 peer 拉取并校验入库。
+/// 确保 [start, end] 覆盖的分片都在本地；缺的**并行**从 peer 拉取并校验入库。
+///
+/// 多源加速：该区间缺多少片，就并发拉多少片（受并发上限约束），
+/// 而不是逐片串行等待。
 fn ensure_range_available(
     ctx: &StreamCtx,
     entry: &StreamEntry,
@@ -73,44 +76,34 @@ fn ensure_range_available(
         None => return Ok(()),
     };
 
-    for idx in first..=last {
-        let hash = match m.chunks.get(idx) {
-            Some(h) => h,
-            None => break,
-        };
-        if ctx.store.has(hash) {
-            continue;
-        }
-        // 缺片：找持有者（排除自己），依次尝试拉取。
-        let peers: Vec<PeerInfo> = ctx
-            .tracker
-            .find_peers(hash)
-            .into_iter()
-            .filter(|p| p.peer_id != ctx.peer_id)
-            .collect();
-        if peers.is_empty() {
-            return Err(format!("no peer has chunk {hash}"));
-        }
-        let mut ok = false;
-        let mut last_err = String::new();
-        for p in &peers {
-            match crate::transfer::fetch_chunk(&p.addr, hash) {
-                Ok(bytes) => {
-                    if ctx.store.put(hash, bytes) {
-                        // 下载到新分片后向 Tracker 宣告，本节点也成为该片的源。
-                        ctx.tracker.announce(&ctx.peer_id, std::slice::from_ref(hash));
-                        ok = true;
-                        break;
-                    } else {
-                        last_err = format!("chunk {hash} failed hash verification");
-                    }
-                }
-                Err(e) => last_err = e,
-            }
-        }
-        if !ok {
-            return Err(format!("fetch {hash} failed: {last_err}"));
-        }
+    // 先算出本区间缺哪些分片。
+    let missing: Vec<String> = (first..=last)
+        .filter_map(|idx| m.chunks.get(idx))
+        .filter(|h| !ctx.store.has(h))
+        .cloned()
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    // 并行拉取（排除自己作为源）。
+    let fetched = crate::transfer::fetch_chunks_parallel(
+        &missing,
+        |hash| {
+            ctx.tracker
+                .find_peers(hash)
+                .into_iter()
+                .filter(|p| p.peer_id != ctx.peer_id)
+                .collect()
+        },
+        &ctx.store,
+        crate::transfer::MAX_CONCURRENT_FETCHES,
+    )?;
+
+    // 批量宣告：本节点现在也是这些分片的源了（一次 Tracker 往返而非 N 次）。
+    if !fetched.is_empty() {
+        ctx.tracker.announce(&ctx.peer_id, &fetched);
     }
     Ok(())
 }

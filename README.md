@@ -54,7 +54,7 @@
   - `chunk.rs` — 内容寻址的分片存储（256 KiB 切片、SHA-256、去重、重组、区间读取）
   - `peer.rs` — `PeerDiscovery` 抽象 + `InMemoryTracker` / `RemoteTracker`
   - `tracker.rs` — 独立 Tracker 服务（TCP，JSON 协议）
-  - `transfer.rs` — 节点间分片直传（TCP，二进制协议）
+  - `transfer.rs` — 节点间分片直传（TCP，二进制协议）+ 并行多源拉取（默认并发 4）
   - `stream.rs` — `stream://` 流式播放协议（HTTP Range 按需拉分片，边下边播）
 
 ## 快速开始
@@ -124,7 +124,7 @@ curl -v -H "Range: bytes=0-99" http://127.0.0.1:9100/<hash>
 ### 测试
 
 ```bash
-cd src-tauri && cargo test    # 13 个单元测试：分片重组、哈希校验、节点索引、分片直传、Range 协议、跨片读取、206/404/416
+cd src-tauri && cargo test    # 17 个单元测试：分片重组、哈希校验、节点索引、分片直传、并行多源拉取、Range 协议、跨片读取、206/404/416
 ```
 
 

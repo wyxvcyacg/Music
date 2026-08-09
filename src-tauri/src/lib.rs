@@ -137,56 +137,48 @@ struct DownloadResult {
     cached: usize,
 }
 
-/// 按清单下载一首曲目：逐分片 find_peers -> fetch_chunk -> 校验入库 -> announce，
-/// 全部就绪后重组返回。本地已有的分片跳过下载（P2P 缓存复用）。
+/// 按清单下载一首曲目：缺失的分片**并行**从各持有者拉取（多源加速），
+/// 校验入库后批量向 Tracker 宣告，全部就绪后重组返回。
+/// 本地已有的分片跳过下载（P2P 缓存复用）。
 #[tauri::command]
 fn download_track(state: State<AppState>, manifest: TrackManifest) -> Result<DownloadResult, String> {
-    let mut fetched = 0usize;
+    // 分出"本地已有"与"需要拉取"。
+    let mut missing = Vec::new();
     let mut cached = 0usize;
-
     for hash in &manifest.chunks {
         if state.store.has(hash) {
             cached += 1;
-            continue;
+        } else {
+            missing.push(hash.clone());
         }
+    }
 
-        // 找持有该分片的节点（排除自己）。
-        let peers: Vec<PeerInfo> = state
-            .tracker
-            .find_peers(hash)
-            .into_iter()
-            .filter(|p| p.peer_id != state.peer_id)
-            .collect();
+    // 并行拉取缺失分片（排除自己作为源）。
+    let fetched_hashes = transfer::fetch_chunks_parallel(
+        &missing,
+        |hash| {
+            state
+                .tracker
+                .find_peers(hash)
+                .into_iter()
+                .filter(|p| p.peer_id != state.peer_id)
+                .collect()
+        },
+        &state.store,
+        transfer::MAX_CONCURRENT_FETCHES,
+    )?;
 
-        if peers.is_empty() {
-            return Err(format!("no peer has chunk {hash}"));
-        }
-
-        // 依次尝试每个候选节点，任一成功即止。
-        let mut got = None;
-        let mut last_err = String::new();
-        for p in &peers {
-            match transfer::fetch_chunk(&p.addr, hash) {
-                Ok(bytes) => {
-                    got = Some(bytes);
-                    break;
-                }
-                Err(e) => last_err = e,
-            }
-        }
-
-        let bytes = got.ok_or_else(|| format!("fetch {hash} failed: {last_err}"))?;
-        // put 会校验内容哈希，防止被污染的数据混入。
-        if !state.store.put(hash, bytes) {
-            return Err(format!("chunk {hash} failed hash verification"));
-        }
-        // 下载到新分片后向 Tracker 宣告：本节点现在也是这片的源了。
-        state.tracker.announce(&state.peer_id, std::slice::from_ref(hash));
-        fetched += 1;
+    // 批量宣告：本节点现在也是这些分片的源了。
+    if !fetched_hashes.is_empty() {
+        state.tracker.announce(&state.peer_id, &fetched_hashes);
     }
 
     let data = state.store.reassemble(&manifest)?;
-    Ok(DownloadResult { data, fetched, cached })
+    Ok(DownloadResult {
+        data,
+        fetched: fetched_hashes.len(),
+        cached,
+    })
 }
 
 /// 本地是否持有某分片。

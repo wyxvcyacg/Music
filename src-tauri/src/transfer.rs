@@ -100,6 +100,103 @@ pub fn fetch_chunk(peer_addr: &str, hash: &str) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
+/// 并行拉取的默认并发上限。本机/局域网够用，也不至于打爆对端。
+pub const MAX_CONCURRENT_FETCHES: usize = 4;
+
+/// 并行拉取多个分片 —— 这是"多源加速"的核心。
+///
+/// 相比逐片串行，N 个缺失分片可同时从（可能不同的）持有者拉取，
+/// 耗时从 N 次往返降到约 1 次往返（受并发上限约束）。
+///
+/// - `hashes`：待拉取的分片（调用方应已过滤掉本地已有的）
+/// - `resolve`：查询某分片的候选源（注入 Tracker 查询，便于测试）
+/// - `store`：拉到后写入此处；`put` 内部校验 SHA-256，并行不影响完整性
+/// - 任一分片的所有候选源都失败 → 返回 Err（与串行版行为一致）
+///
+/// 返回成功拉取的分片哈希（供调用方批量 announce）。
+pub fn fetch_chunks_parallel<F>(
+    hashes: &[String],
+    resolve: F,
+    store: &ChunkStore,
+    max_concurrent: usize,
+) -> Result<Vec<String>, String>
+where
+    F: Fn(&str) -> Vec<crate::peer::PeerInfo> + Send + Sync,
+{
+    use std::sync::Mutex;
+
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 共享任务队列 + 结果收集。
+    let queue = Mutex::new(hashes.to_vec().into_iter().collect::<std::collections::VecDeque<_>>());
+    let fetched: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let first_err: Mutex<Option<String>> = Mutex::new(None);
+
+    let worker_count = max_concurrent.max(1).min(hashes.len());
+
+    // scoped threads：借用 store / resolve 而无需 Arc/clone。
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| loop {
+                // 已有分片彻底失败则提前收工。
+                if first_err.lock().unwrap().is_some() {
+                    return;
+                }
+                let hash = match queue.lock().unwrap().pop_front() {
+                    Some(h) => h,
+                    None => return,
+                };
+                // 另一个 worker 可能刚好拉到同一片（去重）。
+                if store.has(&hash) {
+                    continue;
+                }
+
+                let peers = resolve(&hash);
+                if peers.is_empty() {
+                    let mut e = first_err.lock().unwrap();
+                    if e.is_none() {
+                        *e = Some(format!("no peer has chunk {hash}"));
+                    }
+                    return;
+                }
+
+                // 依次尝试候选源，任一成功即止。
+                let mut ok = false;
+                let mut last_err = String::new();
+                for p in &peers {
+                    match fetch_chunk(&p.addr, &hash) {
+                        Ok(bytes) => {
+                            if store.put(&hash, bytes) {
+                                ok = true;
+                                break;
+                            }
+                            last_err = format!("chunk {hash} failed hash verification");
+                        }
+                        Err(e) => last_err = e,
+                    }
+                }
+
+                if ok {
+                    fetched.lock().unwrap().push(hash);
+                } else {
+                    let mut e = first_err.lock().unwrap();
+                    if e.is_none() {
+                        *e = Some(format!("fetch {hash} failed: {last_err}"));
+                    }
+                    return;
+                }
+            });
+        }
+    });
+
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok(fetched.into_inner().unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +216,123 @@ mod tests {
 
         // 拉一个不存在的分片，应报错。
         assert!(fetch_chunk(&addr, "deadbeef").is_err());
+    }
+
+    #[test]
+    fn parallel_fetch_across_multiple_peers() {
+        use crate::peer::PeerInfo;
+
+        // 三个"远端"节点，各持有一个不同的分片。
+        let mut sources = Vec::new();
+        let mut wanted = Vec::new();
+        for i in 0..3u8 {
+            let payload = vec![i; 1000];
+            let h = hash_bytes(&payload);
+            let remote = Arc::new(ChunkStore::new());
+            remote.put(&h, payload.clone());
+            let addr = start_chunk_server(remote).unwrap();
+            sources.push((h.clone(), addr, payload));
+            wanted.push(h);
+        }
+
+        // 本地空 store，并行拉这三片。
+        let local = ChunkStore::new();
+        let resolve = |hash: &str| -> Vec<PeerInfo> {
+            sources
+                .iter()
+                .filter(|(h, _, _)| h == hash)
+                .map(|(_, addr, _)| PeerInfo {
+                    peer_id: "remote".into(),
+                    addr: addr.clone(),
+                })
+                .collect()
+        };
+
+        let fetched = fetch_chunks_parallel(&wanted, resolve, &local, 4).unwrap();
+        assert_eq!(fetched.len(), 3);
+
+        // 三片都进了本地 store，且内容正确（顺序无关）。
+        for (h, _, payload) in &sources {
+            assert!(local.has(h), "missing chunk {h}");
+            assert_eq!(local.get(h).unwrap(), *payload);
+        }
+    }
+
+    #[test]
+    fn parallel_fetch_errors_when_no_peer() {
+        use crate::peer::PeerInfo;
+        let local = ChunkStore::new();
+        let wanted = vec!["deadbeef".to_string()];
+        // resolve 返回空 → 应报 "no peer has chunk"
+        let resolve = |_: &str| -> Vec<PeerInfo> { Vec::new() };
+        let err = fetch_chunks_parallel(&wanted, resolve, &local, 4).unwrap_err();
+        assert!(err.contains("no peer"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parallel_fetch_skips_already_local() {
+        use crate::peer::PeerInfo;
+        let local = ChunkStore::new();
+        let payload = b"already here".to_vec();
+        let h = hash_bytes(&payload);
+        local.put(&h, payload);
+
+        // resolve 若被调用就会因无源报错；本地已有应直接跳过，不触发查询。
+        let resolve = |_: &str| -> Vec<PeerInfo> { Vec::new() };
+        let fetched = fetch_chunks_parallel(&[h], resolve, &local, 4).unwrap();
+        assert!(fetched.is_empty(), "should not refetch local chunk");
+    }
+
+    /// 证明拉取真的是并行的：resolve 里人为加延迟，
+    /// 4 片并发拉取的总耗时应显著小于串行（4 × 延迟）。
+    #[test]
+    fn parallel_fetch_is_actually_concurrent() {
+        use crate::peer::PeerInfo;
+        use std::time::{Duration, Instant};
+
+        const DELAY: Duration = Duration::from_millis(120);
+        const N: usize = 4;
+
+        // 建 N 个源，各持一片。
+        let mut sources = Vec::new();
+        let mut wanted = Vec::new();
+        for i in 0..N as u8 {
+            let payload = vec![i; 512];
+            let h = hash_bytes(&payload);
+            let remote = Arc::new(ChunkStore::new());
+            remote.put(&h, payload);
+            let addr = start_chunk_server(remote).unwrap();
+            sources.push((h.clone(), addr));
+            wanted.push(h);
+        }
+
+        let local = ChunkStore::new();
+        // 在 resolve 里 sleep，模拟"查源 + 网络往返"的耗时。
+        let resolve = |hash: &str| -> Vec<PeerInfo> {
+            std::thread::sleep(DELAY);
+            sources
+                .iter()
+                .filter(|(h, _)| h == hash)
+                .map(|(_, addr)| PeerInfo {
+                    peer_id: "remote".into(),
+                    addr: addr.clone(),
+                })
+                .collect()
+        };
+
+        let t0 = Instant::now();
+        let fetched = fetch_chunks_parallel(&wanted, resolve, &local, N).unwrap();
+        let elapsed = t0.elapsed();
+
+        assert_eq!(fetched.len(), N);
+        // 串行会是 N × DELAY (480ms)；并行应接近 1 × DELAY。
+        // 留足余量避免 CI 抖动导致假失败，但仍能区分串/并行。
+        let serial_time = DELAY * N as u32;
+        assert!(
+            elapsed < serial_time / 2,
+            "expected concurrent fetch (<{:?}), took {:?}",
+            serial_time / 2,
+            elapsed
+        );
     }
 }
