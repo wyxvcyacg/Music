@@ -58,10 +58,7 @@ fn main() {
     // 注册到 Tracker
     let tracker = Arc::new(RemoteTracker::new(tracker::TRACKER_ADDR));
     tracker.register(
-        PeerInfo {
-            peer_id: peer_id.clone(),
-            addr: chunk_addr.clone(),
-        },
+        PeerInfo::new(peer_id.clone(), chunk_addr.clone()),
         &[],
     );
     println!("[stream_server] peer_id={peer_id}");

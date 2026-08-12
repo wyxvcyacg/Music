@@ -12,11 +12,47 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// 一个节点的可寻址信息。
+///
+/// 三个地址各有分工，都不含用户身份（铁律之一）：
+///   - `addr`        —— TCP 分片服务地址，本机/局域网直连用。
+///   - `udp_addr`    —— 本地 UDP socket 地址，打洞用（阶段四）。
+///   - `public_addr` —— Tracker 观测到的公网地址，打洞时告诉对方往哪打。
+///
+/// 后两个是 `Option` + `#[serde(default)]`：旧版本节点发来的 JSON 没有这两个
+/// 字段也能解析，新旧节点可以互通。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub peer_id: String,
     /// 节点地址（阶段一本机测试即 "127.0.0.1:port"）。
     pub addr: String,
+    /// 本节点 UDP 打洞 socket 地址。None = 不支持 UDP（回退 TCP）。
+    #[serde(default)]
+    pub udp_addr: Option<String>,
+    /// Tracker 观测到的公网地址（由 Tracker 填写，客户端自己填的会被覆盖）。
+    ///
+    /// **注意**：目前是 Tracker 观测的 **TCP** 连接源地址，而打洞用的是 UDP
+    /// 映射。很多 NAT 对两种协议分开映射，两者可能不同 —— 见 docs/nat-plan.md
+    /// 的"已知缺口"。真机测试会输出两者是否一致。
+    #[serde(default)]
+    pub public_addr: Option<String>,
+}
+
+impl PeerInfo {
+    /// 只有 TCP 地址的节点（阶段一/二的形态，也是测试里最常用的构造）。
+    pub fn new(peer_id: impl Into<String>, addr: impl Into<String>) -> Self {
+        Self {
+            peer_id: peer_id.into(),
+            addr: addr.into(),
+            udp_addr: None,
+            public_addr: None,
+        }
+    }
+
+    /// 带 UDP 打洞地址。
+    pub fn with_udp(mut self, udp_addr: impl Into<String>) -> Self {
+        self.udp_addr = Some(udp_addr.into());
+        self
+    }
 }
 
 /// 节点发现接口。找节点、宣告自己持有的分片、上下线。
@@ -161,6 +197,17 @@ impl RemoteTracker {
             .map_err(|e| format!("read failed: {e}"))?;
         serde_json::from_str(resp_line.trim()).map_err(|e| format!("bad response: {e}"))
     }
+
+    /// 问 Tracker"你看到我的地址是什么" —— 最简地址发现。
+    ///
+    /// 返回的是 Tracker 观测到的 **TCP** 源地址。打洞需要的是 UDP 映射地址，
+    /// 两者在很多 NAT 上不同 —— 调用方（punch_test）会把两个都打出来对比。
+    pub fn observed_addr(&self) -> Option<String> {
+        match self.request(&crate::tracker::TrackerRequest::WhereAmI) {
+            Ok(crate::tracker::TrackerResponse::Observed { addr }) => addr,
+            _ => None,
+        }
+    }
 }
 
 impl PeerDiscovery for RemoteTracker {
@@ -204,10 +251,18 @@ mod tests {
     use super::*;
 
     fn peer(id: &str) -> PeerInfo {
-        PeerInfo {
-            peer_id: id.into(),
-            addr: format!("127.0.0.1:0/{id}"),
-        }
+        PeerInfo::new(id, format!("127.0.0.1:0/{id}"))
+    }
+
+    #[test]
+    fn old_json_without_new_fields_still_parses() {
+        // 旧版本节点发来的 JSON 只有 peer_id + addr —— 必须仍能解析，
+        // 否则新旧节点无法互通。
+        let old = r#"{"peer_id":"A","addr":"127.0.0.1:1234"}"#;
+        let p: PeerInfo = serde_json::from_str(old).expect("old JSON must still parse");
+        assert_eq!(p.peer_id, "A");
+        assert_eq!(p.udp_addr, None);
+        assert_eq!(p.public_addr, None);
     }
 
     #[test]

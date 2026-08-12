@@ -100,6 +100,50 @@ pub fn fetch_chunk(peer_addr: &str, hash: &str) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
+/// 按 peer 的能力选择传输方式拉取分片 —— UDP 优先，失败回退 TCP。
+///
+/// 这是整个代码库里**唯一**决定用哪种传输协议的地方。`fetch_chunks_parallel`、
+/// `stream.rs`、`lib.rs` 都只认识 `PeerInfo`，所以新增传输方式只改这一处，
+/// 不碰并行拉取、Range 流式播放、缓存淘汰、曲库。
+///
+/// 顺序的理由：
+/// - 有 `udp_addr` 才试 UDP。老节点没有这个字段 → 直接走 TCP，新旧节点互通。
+/// - UDP 失败**总是**回退 TCP，不把错误抛给调用方。UDP 是加速手段，
+///   不是新的失败点：打洞打不通、对称 NAT、丢包太多，都该退回原来能用的路。
+/// - 两条路的数据最终都进 `ChunkStore::put`，SHA-256 校验一视同仁。
+pub fn fetch_chunk_via(peer: &crate::peer::PeerInfo, hash: &str) -> Result<Vec<u8>, String> {
+    if peer.udp_addr.is_some() {
+        let targets = crate::holepunch::candidates(peer);
+        if !targets.is_empty() {
+            match udp_attempt(&targets, hash) {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => {
+                    // 不是错误，是正常的能力协商结果 —— 记一笔便于诊断，然后回退。
+                    eprintln!("[transfer] udp path failed ({e}), falling back to tcp");
+                }
+            }
+        }
+    }
+    fetch_chunk(&peer.addr, hash)
+}
+
+/// UDP 路径：先打洞，通了再在**同一个 socket** 上拉分片。
+///
+/// 必须复用同一个 socket：打洞打通的是这个 socket 在 NAT 上的映射，
+/// 换 socket 就等于换端口，映射作废，白打一遍。
+fn udp_attempt(targets: &[std::net::SocketAddr], hash: &str) -> Result<Vec<u8>, String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| format!("udp bind failed: {e}"))?;
+    let punched = crate::holepunch::punch(&sock, targets);
+    let addr = punched
+        .addr()
+        .ok_or_else(|| match &punched {
+            crate::holepunch::PunchResult::Failed { reason, .. } => reason.clone(),
+            _ => unreachable!(),
+        })?;
+    crate::udp::fetch_chunk_udp(&sock, addr, hash)
+}
+
 /// 并行拉取的默认并发上限。本机/局域网够用，也不至于打爆对端。
 pub const MAX_CONCURRENT_FETCHES: usize = 4;
 
@@ -166,7 +210,7 @@ where
                 let mut ok = false;
                 let mut last_err = String::new();
                 for p in &peers {
-                    match fetch_chunk(&p.addr, &hash) {
+                    match fetch_chunk_via(p, &hash) {
                         Ok(bytes) => {
                             if store.put(&hash, bytes) {
                                 ok = true;
@@ -241,10 +285,7 @@ mod tests {
             sources
                 .iter()
                 .filter(|(h, _, _)| h == hash)
-                .map(|(_, addr, _)| PeerInfo {
-                    peer_id: "remote".into(),
-                    addr: addr.clone(),
-                })
+                .map(|(_, addr, _)| PeerInfo::new("remote", addr.clone()))
                 .collect()
         };
 
@@ -313,10 +354,7 @@ mod tests {
             sources
                 .iter()
                 .filter(|(h, _)| h == hash)
-                .map(|(_, addr)| PeerInfo {
-                    peer_id: "remote".into(),
-                    addr: addr.clone(),
-                })
+                .map(|(_, addr)| PeerInfo::new("remote", addr.clone()))
                 .collect()
         };
 
@@ -333,6 +371,76 @@ mod tests {
             "expected concurrent fetch (<{:?}), took {:?}",
             serial_time / 2,
             elapsed
+        );
+    }
+
+    #[test]
+    fn fetch_via_uses_tcp_when_peer_has_no_udp() {
+        // 老节点（没有 udp_addr）必须仍然能拉到分片 —— 新旧节点互通。
+        use crate::peer::PeerInfo;
+        let remote = Arc::new(ChunkStore::new());
+        let data = b"legacy peer payload".to_vec();
+        let h = crate::chunk::hash_bytes(&data);
+        remote.put(&h, data.clone());
+        let addr = start_chunk_server(remote).unwrap();
+
+        let peer = PeerInfo::new("old-node", addr);
+        assert!(peer.udp_addr.is_none());
+        assert_eq!(fetch_chunk_via(&peer, &h).unwrap(), data);
+    }
+
+    #[test]
+    fn fetch_via_falls_back_to_tcp_when_udp_is_dead() {
+        // UDP 声明了但实际不可达 —— 必须回退 TCP 而不是把错误抛出去。
+        // 这是"UDP 是加速手段，不是新的失败点"的回归测试。
+        use crate::peer::PeerInfo;
+        let remote = Arc::new(ChunkStore::new());
+        let data = b"fallback works".to_vec();
+        let h = crate::chunk::hash_bytes(&data);
+        remote.put(&h, data.clone());
+        let tcp_addr = start_chunk_server(remote).unwrap();
+
+        // 一个绑了就释放的 UDP 端口 —— 大概率无人接管。
+        let dead_udp = {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let a = s.local_addr().unwrap().to_string();
+            drop(s);
+            a
+        };
+
+        let peer = PeerInfo::new("half-broken", tcp_addr).with_udp(dead_udp);
+        assert_eq!(
+            fetch_chunk_via(&peer, &h).unwrap(),
+            data,
+            "dead UDP must fall back to the working TCP path"
+        );
+    }
+
+    #[test]
+    fn fetch_via_prefers_udp_when_available() {
+        // UDP 可用时应该走 UDP。验证方式：TCP 地址故意指向一个没人监听的
+        // 端口 —— 只有真的走了 UDP 才能成功。
+        use crate::peer::PeerInfo;
+        let store = Arc::new(ChunkStore::new());
+        let data: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let h = crate::chunk::hash_bytes(&data);
+        store.put(&h, data.clone());
+
+        let (udp_addr, sock) = crate::udp::start_udp_server(Arc::clone(&store)).unwrap();
+        std::mem::forget(sock);
+
+        let dead_tcp = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap().to_string();
+            drop(l);
+            a
+        };
+
+        let peer = PeerInfo::new("udp-only", dead_tcp).with_udp(udp_addr);
+        assert_eq!(
+            fetch_chunk_via(&peer, &h).unwrap(),
+            data,
+            "should have transferred over UDP (TCP address is dead)"
         );
     }
 }

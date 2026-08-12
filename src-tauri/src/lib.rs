@@ -12,12 +12,14 @@
 
 pub mod accounts;
 pub mod chunk;
+pub mod holepunch;
 pub mod library;
 pub mod peer;
 pub mod playlist;
 pub mod stream;
 pub mod tracker;
 pub mod transfer;
+pub mod udp;
 
 pub use tracker::{run_tracker, run_tracker_with_data_dir, TRACKER_ADDR};
 
@@ -39,6 +41,8 @@ struct AppState {
     peer_id: String,
     /// 本节点分片服务的监听地址（供别的节点来拉分片）。
     chunk_addr: String,
+    /// 本节点 UDP 分片/打洞端口；None = UDP 起不来，只走 TCP。
+    udp_addr: Option<String>,
     /// 本地分片存储；Arc 与分片服务、流式协议共享同一份。
     store: Arc<ChunkStore>,
     /// 远程 Tracker 客户端（实现 PeerDiscovery）；Arc 便于共享进协议线程。
@@ -437,6 +441,11 @@ fn reassemble(state: State<AppState>, manifest: TrackManifest) -> Result<Vec<u8>
 struct P2pStatus {
     peer_id: String,
     chunk_addr: String,
+    /// 本节点 UDP 端口；None = UDP 不可用，只走 TCP。
+    udp_addr: Option<String>,
+    /// Tracker 观测到的本机地址 —— 判断自己是否在 NAT 后面的依据。
+    /// 与 chunk_addr 的 IP 不同即说明经过了 NAT。
+    observed_addr: Option<String>,
     /// Tracker 是否可达。
     tracker_online: bool,
     owned_chunks: usize,
@@ -449,6 +458,12 @@ fn p2p_status(state: State<AppState>) -> P2pStatus {
     P2pStatus {
         peer_id: state.peer_id.clone(),
         chunk_addr: state.chunk_addr.clone(),
+        udp_addr: state.udp_addr.clone(),
+        observed_addr: if tracker_online {
+            state.tracker.observed_addr()
+        } else {
+            None
+        },
         tracker_online,
         // 用 chunk_count 而非 owned_hashes().len()：这个命令每 2 秒被轮询一次，
         // 不该每次都克隆全部哈希字符串。
@@ -588,16 +603,27 @@ pub fn run() {
                 .expect("failed to start chunk server");
             println!("[client] peer_id={peer_id} chunk_addr={chunk_addr}");
 
+            // UDP 分片服务（阶段四）：与 TCP 并存，用于 NAT 打洞后的直连。
+            // 起不来不是致命错误 —— TCP 路径仍然可用，只是没有加速。
+            let udp_addr = match udp::start_udp_server(Arc::clone(&store)) {
+                Ok((addr, sock)) => {
+                    // 常驻持有 socket：drop 掉会关闭端口，服务线程就白跑了。
+                    std::mem::forget(sock);
+                    println!("[client] udp_addr={addr}");
+                    Some(addr)
+                }
+                Err(e) => {
+                    eprintln!("[client] udp server unavailable ({e}), tcp only");
+                    None
+                }
+            };
+
             // 连接 Tracker 并注册自己，连同已恢复的分片一起宣告
             // —— 重启后立刻能继续为这些分片供源。
             let tracker = Arc::new(RemoteTracker::new(tracker::TRACKER_ADDR));
-            tracker.register(
-                PeerInfo {
-                    peer_id: peer_id.clone(),
-                    addr: chunk_addr.clone(),
-                },
-                &store.owned_hashes(),
-            );
+            let mut me = PeerInfo::new(peer_id.clone(), chunk_addr.clone());
+            me.udp_addr = udp_addr.clone();
+            tracker.register(me, &store.owned_hashes());
 
             // 恢复上次的登录会话（token 可能已失效，current_user 会校验）。
             let session_path = data_dir.as_ref().map(|d| d.join("session.json"));
@@ -612,6 +638,7 @@ pub fn run() {
             let state = AppState {
                 peer_id,
                 chunk_addr,
+                udp_addr,
                 store,
                 tracker,
                 stream_registry: Arc::new(Mutex::new(HashMap::new())),

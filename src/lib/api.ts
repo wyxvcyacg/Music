@@ -12,6 +12,10 @@ export type TrackManifest = {
 export type P2pStatus = {
   peer_id: string;
   chunk_addr: string;
+  /** 本节点 UDP 端口；null = UDP 不可用，只走 TCP。 */
+  udp_addr: string | null;
+  /** Tracker 观测到的本机地址。与 chunk_addr 的 IP 不同即说明经过了 NAT。 */
+  observed_addr: string | null;
   tracker_online: boolean;
   owned_chunks: number;
 };

@@ -57,7 +57,9 @@
   - `accounts.rs` — 账号系统（盐 + PBKDF2-HMAC-SHA256、token 鉴权）
   - `peer.rs` — `PeerDiscovery` 抽象 + `InMemoryTracker` / `RemoteTracker`
   - `tracker.rs` — 独立 Tracker 服务（TCP，JSON 协议）
-  - `transfer.rs` — 节点间分片直传（TCP，二进制协议）+ 并行多源拉取（默认并发 4）
+  - `transfer.rs` — 节点间分片直传（TCP，二进制协议）+ 并行多源拉取（默认并发 4）+ UDP/TCP 策略选择
+  - `udp.rs` — UDP 分片传输（NACK 补发的手写可靠层，无拥塞控制）
+  - `holepunch.rs` — NAT 打洞（PING/PONG 探测，打不通就回退 TCP）
   - `stream.rs` — `stream://` 流式播放协议（HTTP Range 按需拉分片，边下边播）
 
 ## 快速开始
@@ -128,9 +130,19 @@ curl -v -H "Range: bytes=0-99" http://127.0.0.1:9100/<hash>
 ### 测试
 
 ```bash
-cd src-tauri && cargo test    # 49 个单元测试：分片重组/持久化/淘汰、曲库读写、播放列表顺序与持久化、账号鉴权（含 HMAC 已知向量）、哈希校验、节点索引、分片直传、并行多源拉取、Range 协议、跨片读取
+cd src-tauri && cargo test    # 75 个单元测试：分片重组/持久化/淘汰、曲库读写、播放列表顺序与持久化、账号鉴权（含 HMAC 已知向量）、哈希校验、节点索引、分片直传、并行多源拉取、Range 协议、跨片读取、UDP 分片传输与丢包重传、NAT 打洞、UDP→TCP 回退
 ```
 
+NAT 打洞真机实测（本机也能跑，但要跨网络才有诊断意义）：
+
+```bash
+cargo run --bin music -- --tracker          # 终端 1
+cargo run --bin punch_test                  # 终端 2：打印自己的 peer_id 后等待
+cargo run --bin punch_test -- --peer <对方peer_id>   # 另一台机器
+```
+
+它会打印本机 UDP 端口、Tracker 观测到的地址、是否在 NAT 后、以及打洞结果。
+真正有价值的用法是「家里 WiFi + 手机热点」两端各跑一次。
 
 ## 安全声明
 
@@ -140,6 +152,10 @@ cd src-tauri && cargo test    # 49 个单元测试：分片重组/持久化/淘�
 - 密码本身**不以明文或裸哈希存储**：每用户独立随机盐 + PBKDF2-HMAC-SHA256（10 万轮）。
   但 PBKDF2 不如 Argon2id 抗 GPU 并行破解，生产环境应替换。
 - 随机数（盐、token）由时间/PID/ASLR 熵源派生，非 OS CSPRNG；生产应改用 `getrandom`。
+- **分片传输（TCP 与 UDP 两条路）均不加密** —— 中间人能看到传了什么。
+- **UDP 传输无拥塞控制**（固定发包间隔），不适合公网大规模使用。
+- **NAT 打洞不保证成功**：对称 NAT / CGNAT 打不通就回退 TCP，也就是跨 NAT 传不了
+  （未实现 TURN 中继）。中国大陆家宽普遍 CGNAT，成功率预期低于国外统计数字。
 - 请勿在此使用你在其他服务上用过的真实密码。
 
 分片完整性是有保障的：每个分片写入前校验 SHA-256，被篡改的数据会被拒绝。

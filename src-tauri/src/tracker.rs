@@ -54,6 +54,10 @@ pub enum TrackerRequest {
     /// 用 token 查询当前身份。
     #[serde(rename = "whoami")]
     WhoAmI { token: String },
+    /// 问 Tracker："你看到我的地址是什么？"—— 最简地址发现（阶段四）。
+    ///
+    /// 不需要注册也能问，因为它就是为了在注册前先搞清楚自己的公网地址。
+    WhereAmI,
 }
 
 /// Tracker → 客户端的响应。
@@ -68,6 +72,11 @@ pub enum TrackerResponse {
     Auth { token: String, username: String },
     /// whoami 结果；未登录或 token 失效时 username 为 None。
     Identity { username: Option<String> },
+    /// Tracker 观测到的请求方地址（地址发现，阶段四）。
+    ///
+    /// **这是 TCP 连接的源地址**。打洞用的是 UDP 映射，很多 NAT 对两种协议
+    /// 分开映射 —— 两者可能不同。见 docs/nat-plan.md。
+    Observed { addr: Option<String> },
     Error { message: String },
 }
 
@@ -89,14 +98,21 @@ pub struct SharedTrack {
 type ManifestStore = Arc<Mutex<HashMap<String, SharedTrack>>>;
 
 /// 处理单个请求，返回响应。
+///
+/// `observed` 是 Tracker 从 TCP 连接上看到的请求方源地址 —— 地址发现的依据。
+/// 客户端**不能**自己声明公网地址（会被覆盖）：自报的地址不可信，而连接的
+/// 源地址是传输层给的事实。
 fn handle(
     req: TrackerRequest,
     tracker: &InMemoryTracker,
     manifests: &ManifestStore,
     accounts: &Accounts,
+    observed: Option<std::net::SocketAddr>,
 ) -> TrackerResponse {
     match req {
-        TrackerRequest::Register { peer, chunks } => {
+        TrackerRequest::Register { mut peer, chunks } => {
+            // 用观测到的地址覆盖客户端自报的 public_addr。
+            peer.public_addr = observed.map(|a| a.to_string());
             tracker.register(peer, &chunks);
             TrackerResponse::Ok
         }
@@ -156,6 +172,9 @@ fn handle(
         TrackerRequest::WhoAmI { token } => TrackerResponse::Identity {
             username: accounts.verify(&token),
         },
+        TrackerRequest::WhereAmI => TrackerResponse::Observed {
+            addr: observed.map(|a| a.to_string()),
+        },
     }
 }
 
@@ -179,7 +198,7 @@ fn serve_conn(
     }
 
     let resp = match serde_json::from_str::<TrackerRequest>(line.trim()) {
-        Ok(req) => handle(req, &tracker, &manifests, &accounts),
+        Ok(req) => handle(req, &tracker, &manifests, &accounts, peer),
         Err(e) => TrackerResponse::Error {
             message: format!("bad request: {e}"),
         },
@@ -190,7 +209,6 @@ fn serve_conn(
         let _ = writer.write_all(json.as_bytes());
         let _ = writer.flush();
     }
-    let _ = peer; // 保留用于将来日志
 }
 
 /// 阻塞运行 Tracker 服务（`--tracker` 模式的入口）。

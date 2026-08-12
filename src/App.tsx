@@ -92,8 +92,21 @@ function fmtBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
-type View = "library" | "network" | "search" | "playlists";
+/**
+ * 判断本机是否在 NAT 后面 —— 对比本地监听 IP 与 Tracker 观测到的 IP。
+ *
+ * 只比 IP 不比端口：端口在 NAT 后几乎必然不同，那不说明问题；IP 不同才
+ * 意味着流量经过了地址转换，需要打洞才能被外部节点直连。
+ */
+function natHint(s: P2pStatus): string {
+  if (!s.observed_addr) return "";
+  const localIp = s.chunk_addr.split(":")[0];
+  const seenIp = s.observed_addr.split(":").slice(0, -1).join(":");
+  if (localIp === seenIp) return "（直连）";
+  return "（NAT 后，需打洞）";
+}
 
+type View = "library" | "network" | "search" | "playlists";
 /** 播放顺序模式。顺序 → 单曲循环 → 列表循环，随机独立开关。 */
 type RepeatMode = "off" | "one" | "all";
 
@@ -616,6 +629,10 @@ function App() {
                   </span>
                 </div>
                 <StatusRow label="本地分片" value={`${status.owned_chunks}`} />
+                <StatusRow
+                  label="传输"
+                  value={status.udp_addr ? "UDP + TCP" : "仅 TCP"}
+                />
                 {cache && (
                   <StatusRow
                     label="缓存占用"
@@ -625,6 +642,12 @@ function App() {
                 <div className="truncate pt-1 text-[10px] text-muted-foreground/70">
                   peer: {status.peer_id.slice(0, 8)}… @ {status.chunk_addr}
                 </div>
+                {status.observed_addr && (
+                  <div className="truncate text-[10px] text-muted-foreground/70">
+                    外部看到: {status.observed_addr}
+                    {natHint(status)}
+                  </div>
+                )}
               </>
             ) : (
               <div className="text-[11px] text-muted-foreground/70">
