@@ -27,6 +27,7 @@ import {
   User,
   LogIn,
   LogOut,
+  X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -85,7 +86,7 @@ function fmtBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
-type View = "library" | "network";
+type View = "library" | "network" | "search";
 
 /** 播放顺序模式。顺序 → 单曲循环 → 列表循环，随机独立开关。 */
 type RepeatMode = "off" | "one" | "all";
@@ -117,6 +118,8 @@ function App() {
   const [user, setUser] = useState<string | null>(null);
   /** 登录/注册对话框是否打开。 */
   const [authOpen, setAuthOpen] = useState(false);
+  /** 搜索关键词。 */
+  const [query, setQuery] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const nextId = useRef(100);
 
@@ -195,9 +198,9 @@ function App() {
     }
   }, []);
 
-  // 进入"节点网络"视图时刷新共享曲库。
+  // 进入"节点网络"视图时刷新共享曲库。搜索也要覆盖网络，所以一并刷新。
   useEffect(() => {
-    if (view === "network") refreshShared();
+    if (view === "network" || view === "search") refreshShared();
   }, [view, refreshShared]);
 
   function playTrack(t: Track) {
@@ -513,7 +516,12 @@ function App() {
               </Button>
             )}
           </div>
-          <NavItem icon={<Search className="size-4" />} label="搜索" />
+          <NavItem
+            icon={<Search className="size-4" />}
+            label="搜索"
+            active={view === "search"}
+            onClick={() => setView("search")}
+          />
           <NavItem
             icon={<Library className="size-4" />}
             label="曲库"
@@ -612,6 +620,18 @@ function App() {
               onRemove={onRemove}
               loggedIn={!!user}
               onImport={() => fileInputRef.current?.click()}
+            />
+          ) : view === "search" ? (
+            <SearchView
+              query={query}
+              onQuery={setQuery}
+              tracks={tracks}
+              shared={shared}
+              current={current}
+              downloading={downloading}
+              onPlay={playTrack}
+              onStreamPlay={onStreamPlay}
+              onDownload={onDownload}
             />
           ) : (
             <NetworkView
@@ -1022,6 +1042,185 @@ function LibraryView({
         </table>
         )}
       </div>
+    </>
+  );
+}
+
+/**
+ * 搜索视图 —— 同时搜本地曲库和节点网络。
+ *
+ * 对 P2P 播放器来说这两个来源必须放一起：用户想的是"我要听这首歌"，
+ * 不是"我要先想清楚它在不在我硬盘上"。已在本地的标出来，其余可直接边下边播。
+ */
+function SearchView({
+  query,
+  onQuery,
+  tracks,
+  shared,
+  current,
+  downloading,
+  onPlay,
+  onStreamPlay,
+  onDownload,
+}: {
+  query: string;
+  onQuery: (q: string) => void;
+  tracks: Track[];
+  shared: SharedTrack[];
+  current: Track | null;
+  downloading: Set<string>;
+  onPlay: (t: Track) => void;
+  onStreamPlay: (s: SharedTrack) => void;
+  onDownload: (s: SharedTrack) => void;
+}) {
+  const q = query.trim().toLowerCase();
+  const match = (...fields: (string | undefined)[]) =>
+    fields.some((f) => f?.toLowerCase().includes(q));
+
+  const localHits = q ? tracks.filter((t) => match(t.title, t.artist)) : [];
+  // 本地已有的曲目不在网络结果里重复出现 —— 同一首歌只该显示一行。
+  const localHashes = new Set(
+    tracks.filter((t) => t.manifest).map((t) => t.manifest!.track_hash)
+  );
+  const netHits = q
+    ? shared.filter(
+        (s) =>
+          match(s.title, s.artist, s.publisher) &&
+          !localHashes.has(s.manifest.track_hash)
+      )
+    : [];
+  const total = localHits.length + netHits.length;
+
+  return (
+    <>
+      <div className="mb-6">
+        <h1 className="text-2xl font-bold">搜索</h1>
+        <p className="text-sm text-muted-foreground">
+          同时搜本地曲库与节点网络 —— 网络上的结果可直接边下边播
+        </p>
+      </div>
+
+      <div className="mb-6 flex items-center gap-2 rounded-md border border-input bg-background px-3 py-2">
+        <Search className="size-4 shrink-0 text-muted-foreground" />
+        <input
+          autoFocus
+          value={query}
+          onChange={(e) => onQuery(e.target.value)}
+          placeholder="搜索标题、艺术家、发布者…"
+          className="min-w-0 flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none"
+        />
+        {query && (
+          <button
+            onClick={() => onQuery("")}
+            className="text-muted-foreground hover:text-foreground"
+            title="清空"
+          >
+            <X className="size-4" />
+          </button>
+        )}
+      </div>
+
+      {!q ? (
+        <div className="rounded-lg border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
+          输入关键词开始搜索。
+        </div>
+      ) : total === 0 ? (
+        <div className="rounded-lg border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
+          没有匹配「{query}」的结果。
+          <div className="mt-1 text-xs text-muted-foreground/70">
+            本地曲库和已发布的共享曲库里都没有找到。
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-6">
+          {localHits.length > 0 && (
+            <section>
+              <h2 className="mb-2 flex items-center gap-1.5 text-sm font-medium text-muted-foreground">
+                <Library className="size-3.5" /> 本地曲库
+                <span className="tabular-nums">({localHits.length})</span>
+              </h2>
+              <div className="overflow-hidden rounded-lg border border-border">
+                {localHits.map((t) => (
+                  <div
+                    key={t.id}
+                    onClick={() => t.url && onPlay(t)}
+                    className={cn(
+                      "flex items-center gap-3 border-b border-border px-4 py-2.5 text-sm last:border-b-0 transition-colors",
+                      t.url ? "cursor-pointer hover:bg-accent/50" : "opacity-60",
+                      current?.id === t.id && "bg-accent/40"
+                    )}
+                  >
+                    <Play className="size-3.5 shrink-0 text-primary" />
+                    <span className="min-w-0 flex-1 truncate font-medium">
+                      {t.title}
+                    </span>
+                    <span className="w-40 truncate text-muted-foreground">
+                      {t.artist}
+                    </span>
+                    <span className="inline-flex items-center gap-1 text-xs text-emerald-400">
+                      <CheckCircle2 className="size-3.5" /> 已在本地
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {netHits.length > 0 && (
+            <section>
+              <h2 className="mb-2 flex items-center gap-1.5 text-sm font-medium text-muted-foreground">
+                <Users className="size-3.5" /> 节点网络
+                <span className="tabular-nums">({netHits.length})</span>
+              </h2>
+              <div className="overflow-hidden rounded-lg border border-border">
+                {netHits.map((s) => {
+                  const busy = downloading.has(s.manifest.track_hash);
+                  return (
+                    <div
+                      key={s.manifest.track_hash}
+                      className="flex items-center gap-3 border-b border-border px-4 py-2.5 text-sm last:border-b-0"
+                    >
+                      <span className="min-w-0 flex-1 truncate font-medium">
+                        {s.title}
+                      </span>
+                      <span className="w-32 truncate text-muted-foreground">
+                        {s.artist}
+                      </span>
+                      <span className="w-24 truncate text-xs text-muted-foreground">
+                        {s.publisher && (
+                          <span className="inline-flex items-center gap-1">
+                            <User className="size-3" />
+                            {s.publisher}
+                          </span>
+                        )}
+                      </span>
+                      <span className="w-16 text-right text-xs text-muted-foreground tabular-nums">
+                        {fmtBytes(s.manifest.total_size)}
+                      </span>
+                      <Button size="sm" onClick={() => onStreamPlay(s)}>
+                        <Play className="size-3.5" /> 播放
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() => onDownload(s)}
+                        title="完整下载到本地"
+                      >
+                        {busy ? (
+                          <Loader2 className="size-3.5 animate-spin" />
+                        ) : (
+                          <Download className="size-3.5" />
+                        )}
+                      </Button>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
+        </div>
+      )}
     </>
   );
 }
