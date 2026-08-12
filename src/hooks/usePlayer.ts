@@ -19,7 +19,7 @@ export type PlayerState = {
   volume: number;
 };
 
-export function usePlayer() {
+export function usePlayer(opts: { onEnded?: () => void } = {}) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [state, setState] = useState<PlayerState>({
     playing: false,
@@ -28,6 +28,10 @@ export function usePlayer() {
     buffered: 0,
     volume: 1,
   });
+
+  // 把回调放进 ref：调用方每次渲染传新函数也不用重挂事件监听。
+  const onEndedRef = useRef(opts.onEnded);
+  onEndedRef.current = opts.onEnded;
 
   // 惰性创建单例 audio 元素。
   if (audioRef.current === null && typeof Audio !== "undefined") {
@@ -44,7 +48,10 @@ export function usePlayer() {
       setState((s) => ({ ...s, duration: audio.duration || 0 }));
     const onPlay = () => setState((s) => ({ ...s, playing: true }));
     const onPause = () => setState((s) => ({ ...s, playing: false }));
-    const onEnded = () => setState((s) => ({ ...s, playing: false }));
+    const onEnded = () => {
+      setState((s) => ({ ...s, playing: false }));
+      onEndedRef.current?.();
+    };
     const onProgress = () => {
       // 取最后一个缓冲区间的末尾，作为"已缓冲到"的位置。
       const b = audio.buffered;

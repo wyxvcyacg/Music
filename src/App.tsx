@@ -6,6 +6,7 @@ import {
   SkipForward,
   Shuffle,
   Repeat,
+  Repeat1,
   Volume2,
   Library,
   Search,
@@ -86,14 +87,26 @@ function fmtBytes(n: number): string {
 
 type View = "library" | "network";
 
+/** 播放顺序模式。顺序 → 单曲循环 → 列表循环，随机独立开关。 */
+type RepeatMode = "off" | "one" | "all";
+
 function App() {
-  const player = usePlayer();
+  /**
+   * 一曲播完后自动跳下一首。用 ref 间接调用是因为 usePlayer 必须在
+   * playTrack / advance 定义之前调用（hooks 顺序），拿不到它们的引用。
+   */
+  const advanceRef = useRef<(dir: 1 | -1, auto?: boolean) => void>(() => {});
+  const player = usePlayer({ onEnded: () => advanceRef.current(1, true) });
   const [tracks, setTracks] = useState<Track[]>(isTauri() ? [] : DEMO_TRACKS);
   const [current, setCurrent] = useState<Track | null>(null);
   const [status, setStatus] = useState<P2pStatus | null>(null);
   const [cache, setCache] = useState<CacheStats | null>(null);
   const [shared, setShared] = useState<SharedTrack[]>([]);
   const [view, setView] = useState<View>("library");
+  /** 随机播放开关。 */
+  const [shuffle, setShuffle] = useState(false);
+  /** 循环模式。 */
+  const [repeat, setRepeat] = useState<RepeatMode>("off");
   /** 正在下载的 track_hash 集合。 */
   const [downloading, setDownloading] = useState<Set<string>>(new Set());
   /** 粘贴链接输入框内容。 */
@@ -191,6 +204,49 @@ function App() {
     setCurrent(t);
     if (t.url) player.load(t.url, true);
   }
+
+  /** 可播放的曲目（导入中/失败的跳过）。 */
+  const playable = tracks.filter((t) => t.url);
+
+  /**
+   * 切到上/下一首。
+   *
+   * `auto` 表示由"播完"触发而非用户点击 —— 只有这种情况才尊重循环模式：
+   * 顺序播放放到最后一首就停，而用户手点「下一首」始终该有反应（绕回队首）。
+   */
+  const advance = useCallback(
+    (dir: 1 | -1, auto = false) => {
+      if (playable.length === 0) return;
+
+      // 单曲循环只在自动续播时生效，否则用户永远切不出去。
+      if (auto && repeat === "one" && current?.url) {
+        player.load(current.url, true);
+        return;
+      }
+
+      if (shuffle && playable.length > 1) {
+        // 从"除当前曲目之外"的集合里挑，保证随机时不会连播同一首。
+        const others = playable.filter((t) => t.id !== current?.id);
+        playTrack(others[Math.floor(Math.random() * others.length)]);
+        return;
+      }
+
+      const idx = playable.findIndex((t) => t.id === current?.id);
+      const next = idx < 0 ? 0 : idx + dir;
+      if (next < 0 || next >= playable.length) {
+        // 越界：列表循环（或用户手动点击）绕回另一端，顺序播放则停下。
+        if (auto && repeat !== "all") return;
+        playTrack(playable[(next + playable.length) % playable.length]);
+        return;
+      }
+      playTrack(playable[next]);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [playable, current, shuffle, repeat, player.seek, player.load]
+  );
+
+  // 让 onEnded 回调始终看到最新的 advance。
+  advanceRef.current = advance;
 
   function patchTrack(id: number, patch: Partial<Track>) {
     setTracks((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
@@ -590,10 +646,24 @@ function App() {
 
           <div className="flex flex-1 flex-col items-center gap-1.5">
             <div className="flex items-center gap-2">
-              <Button variant="ghost" size="icon" className="text-muted-foreground">
+              <Button
+                variant="ghost"
+                size="icon"
+                className={cn(
+                  shuffle ? "text-primary" : "text-muted-foreground"
+                )}
+                title={shuffle ? "随机播放：开" : "随机播放：关"}
+                onClick={() => setShuffle((v) => !v)}
+              >
                 <Shuffle />
               </Button>
-              <Button variant="ghost" size="icon">
+              <Button
+                variant="ghost"
+                size="icon"
+                disabled={playable.length === 0}
+                title="上一首"
+                onClick={() => advance(-1)}
+              >
                 <SkipBack />
               </Button>
               <Button
@@ -603,11 +673,35 @@ function App() {
               >
                 {player.playing ? <Pause /> : <Play />}
               </Button>
-              <Button variant="ghost" size="icon">
+              <Button
+                variant="ghost"
+                size="icon"
+                disabled={playable.length === 0}
+                title="下一首"
+                onClick={() => advance(1)}
+              >
                 <SkipForward />
               </Button>
-              <Button variant="ghost" size="icon" className="text-muted-foreground">
-                <Repeat />
+              <Button
+                variant="ghost"
+                size="icon"
+                className={cn(
+                  repeat !== "off" ? "text-primary" : "text-muted-foreground"
+                )}
+                title={
+                  repeat === "off"
+                    ? "顺序播放"
+                    : repeat === "all"
+                      ? "列表循环"
+                      : "单曲循环"
+                }
+                onClick={() =>
+                  setRepeat((m) =>
+                    m === "off" ? "all" : m === "all" ? "one" : "off"
+                  )
+                }
+              >
+                {repeat === "one" ? <Repeat1 /> : <Repeat />}
               </Button>
             </div>
             <div className="flex w-full max-w-xl items-center gap-2 text-xs text-muted-foreground">
