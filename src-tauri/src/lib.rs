@@ -14,6 +14,7 @@ pub mod accounts;
 pub mod chunk;
 pub mod library;
 pub mod peer;
+pub mod playlist;
 pub mod stream;
 pub mod tracker;
 pub mod transfer;
@@ -22,6 +23,7 @@ pub use tracker::{run_tracker, run_tracker_with_data_dir, TRACKER_ADDR};
 
 use chunk::{ChunkStore, TrackManifest};
 use library::{Library, LibraryTrack};
+use playlist::{Playlist, Playlists};
 use peer::{PeerDiscovery, PeerInfo, RemoteTracker};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -45,6 +47,8 @@ struct AppState {
     stream_registry: Arc<Mutex<HashMap<String, StreamEntry>>>,
     /// 持久化的本地曲库 —— 同时定义了缓存淘汰的"受保护"分片集合。
     lib: Arc<Library>,
+    /// 持久化的播放列表。只存 track_hash 引用，曲目真身在 `lib` 里。
+    playlists: Arc<Playlists>,
     /// 当前登录会话（阶段三）。与 `peer_id` **并存且互不干扰** ——
     /// 铁律之一的落地：登出/换账号都不影响 P2P 传输。
     session: Mutex<Option<Session>>,
@@ -155,6 +159,48 @@ fn remove_from_library(state: State<AppState>, track_hash: String) -> bool {
         state.enforce_cache_limit();
     }
     removed
+}
+
+/// 列出所有播放列表。
+#[tauri::command]
+fn list_playlists(state: State<AppState>) -> Vec<Playlist> {
+    state.playlists.list()
+}
+
+/// 新建播放列表，返回它的 id。
+#[tauri::command]
+fn create_playlist(state: State<AppState>, name: String) -> String {
+    state.playlists.create(name)
+}
+
+/// 重命名播放列表。
+#[tauri::command]
+fn rename_playlist(state: State<AppState>, id: String, name: String) -> bool {
+    state.playlists.rename(&id, name)
+}
+
+/// 删除播放列表。**不动曲库、不动分片** —— 只是删掉一份顺序清单。
+#[tauri::command]
+fn delete_playlist(state: State<AppState>, id: String) -> bool {
+    state.playlists.delete(&id)
+}
+
+/// 往播放列表末尾追加一首曲目（按 track_hash 引用）。
+#[tauri::command]
+fn add_to_playlist(state: State<AppState>, id: String, track_hash: String) -> bool {
+    state.playlists.add_track(&id, track_hash)
+}
+
+/// 按位置从播放列表移除一首（同一首歌可重复出现，所以用位置而非 hash）。
+#[tauri::command]
+fn remove_from_playlist(state: State<AppState>, id: String, index: usize) -> bool {
+    state.playlists.remove_at(&id, index)
+}
+
+/// 整表提交新的曲目顺序。
+#[tauri::command]
+fn reorder_playlist(state: State<AppState>, id: String, tracks: Vec<String>) -> bool {
+    state.playlists.reorder(&id, tracks)
 }
 
 /// 登记一首曲目为可流式播放，返回 `<audio>` 可用的 stream URL。
@@ -482,6 +528,13 @@ pub fn run() {
             cache_stats,
             list_library,
             remove_from_library,
+            list_playlists,
+            create_playlist,
+            rename_playlist,
+            delete_playlist,
+            add_to_playlist,
+            remove_from_playlist,
+            reorder_playlist,
             current_user,
             register_account,
             login,
@@ -490,10 +543,10 @@ pub fn run() {
         .setup(|app| {
             let peer_id = Uuid::new_v4().to_string();
 
-            // 分片缓存与曲库都放在 app_data_dir 下。拿不到目录时回退到
-            // 内存模式（缓存与曲库都不持久化），不影响基本可用性。
+            // 分片缓存、曲库、播放列表都放在 app_data_dir 下。拿不到目录时回退到
+            // 内存模式（都不持久化），不影响基本可用性。
             let data_dir = app.path().app_data_dir().ok();
-            let (store, lib) = match &data_dir {
+            let (store, lib, playlists) = match &data_dir {
                 Some(base) => {
                     let dir = base.join("chunks");
                     let store = match ChunkStore::open(&dir) {
@@ -512,11 +565,21 @@ pub fn run() {
                     };
                     let lib = Arc::new(Library::open(library::library_path(base)));
                     println!("[client] library: {} tracks restored", lib.list().len());
-                    (store, lib)
+                    let playlists =
+                        Arc::new(Playlists::open(playlist::playlists_path(base)));
+                    println!(
+                        "[client] playlists: {} restored",
+                        playlists.list().len()
+                    );
+                    (store, lib, playlists)
                 }
                 None => {
                     eprintln!("[client] no app data dir, using memory cache + library");
-                    (Arc::new(ChunkStore::new()), Arc::new(Library::new()))
+                    (
+                        Arc::new(ChunkStore::new()),
+                        Arc::new(Library::new()),
+                        Arc::new(Playlists::new()),
+                    )
                 }
             };
 
@@ -553,6 +616,7 @@ pub fn run() {
                 tracker,
                 stream_registry: Arc::new(Mutex::new(HashMap::new())),
                 lib,
+                playlists,
                 session: Mutex::new(session),
                 session_path,
             };

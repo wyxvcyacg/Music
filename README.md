@@ -18,7 +18,7 @@
 - [x] 流式播放引擎：边下边播（`stream://` 协议 + HTTP Range 按需拉分片）
 - [x] 音频解码与播放：由 WebView `<audio>` 原生解码（MP3 / FLAC / AAC / OGG 等）
 - [x] 本地资源库：曲库持久化（跨重启恢复）、分片磁盘缓存、带保护的 LRU 淘汰（默认 2 GiB）
-- [ ] 桌面 UI：播放控制（播放/暂停、上下一首、随机、顺序/列表循环/单曲循环）、进度与缓冲可视化、传输状态、账号面板 —— 搜索与播放列表尚未实现
+- [x] 桌面 UI：播放控制（播放/暂停、上下一首、随机、顺序/列表循环/单曲循环）、进度与缓冲可视化、传输状态、账号面板、搜索（本地 + 网络）、播放列表
 - [x] 种子/资源标识：基于内容哈希的曲目寻址（SHA-256 分片定位）
 
 ## 技术架构（规划）
@@ -53,6 +53,7 @@
 - **P2P 核心**（Rust，标准库 `std::net` + `std::thread`，无额外运行时）：
   - `chunk.rs` — 内容寻址的分片存储（256 KiB 切片、SHA-256、去重、重组、区间读取、磁盘持久化、LRU 淘汰）
   - `library.rs` — 本地曲库持久化（JSON），同时定义淘汰的受保护分片集合
+  - `playlist.rs` — 播放列表持久化（JSON）；只存 `track_hash` 引用，不复制 manifest
   - `accounts.rs` — 账号系统（盐 + PBKDF2-HMAC-SHA256、token 鉴权）
   - `peer.rs` — `PeerDiscovery` 抽象 + `InMemoryTracker` / `RemoteTracker`
   - `tracker.rs` — 独立 Tracker 服务（TCP，JSON 协议）
@@ -127,7 +128,7 @@ curl -v -H "Range: bytes=0-99" http://127.0.0.1:9100/<hash>
 ### 测试
 
 ```bash
-cd src-tauri && cargo test    # 40 个单元测试：分片重组/持久化/淘汰、曲库读写、账号鉴权（含 HMAC 已知向量）、哈希校验、节点索引、分片直传、并行多源拉取、Range 协议、跨片读取
+cd src-tauri && cargo test    # 49 个单元测试：分片重组/持久化/淘汰、曲库读写、播放列表顺序与持久化、账号鉴权（含 HMAC 已知向量）、哈希校验、节点索引、分片直传、并行多源拉取、Range 协议、跨片读取
 ```
 
 

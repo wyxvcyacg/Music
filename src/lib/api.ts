@@ -104,6 +104,61 @@ export async function removeFromLibrary(trackHash: string): Promise<boolean> {
   return invoke<boolean>("remove_from_library", { trackHash });
 }
 
+/** 与 Rust playlist.rs 的 Playlist 对应。`tracks` 是 track_hash 引用，顺序即播放顺序。 */
+export type Playlist = {
+  id: string;
+  name: string;
+  tracks: string[];
+  created_at: number;
+};
+
+/** 列出所有播放列表。 */
+export async function listPlaylists(): Promise<Playlist[]> {
+  return invoke<Playlist[]>("list_playlists");
+}
+
+/** 新建播放列表，返回它的 id。 */
+export async function createPlaylist(name: string): Promise<string> {
+  return invoke<string>("create_playlist", { name });
+}
+
+/** 重命名播放列表。 */
+export async function renamePlaylist(
+  id: string,
+  name: string
+): Promise<boolean> {
+  return invoke<boolean>("rename_playlist", { id, name });
+}
+
+/** 删除播放列表。不影响曲库与分片。 */
+export async function deletePlaylist(id: string): Promise<boolean> {
+  return invoke<boolean>("delete_playlist", { id });
+}
+
+/** 往播放列表末尾追加一首曲目。 */
+export async function addToPlaylist(
+  id: string,
+  trackHash: string
+): Promise<boolean> {
+  return invoke<boolean>("add_to_playlist", { id, trackHash });
+}
+
+/** 按位置从播放列表移除一首（允许重复曲目，所以用位置而非 hash）。 */
+export async function removeFromPlaylist(
+  id: string,
+  index: number
+): Promise<boolean> {
+  return invoke<boolean>("remove_from_playlist", { id, index });
+}
+
+/** 整表提交新的曲目顺序。 */
+export async function reorderPlaylist(
+  id: string,
+  tracks: string[]
+): Promise<boolean> {
+  return invoke<boolean>("reorder_playlist", { id, tracks });
+}
+
 /** 发布一首曲目到共享曲库（Tracker 上的其他节点可发现并下载）。 */
 export async function publishTrack(
   manifest: TrackManifest,

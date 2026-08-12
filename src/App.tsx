@@ -44,6 +44,11 @@ import {
   cacheStats,
   listLibrary,
   removeFromLibrary,
+  listPlaylists,
+  createPlaylist,
+  deletePlaylist,
+  addToPlaylist,
+  removeFromPlaylist,
   currentUser,
   registerAccount,
   login as apiLogin,
@@ -55,6 +60,7 @@ import {
   type P2pStatus,
   type SharedTrack,
   type CacheStats,
+  type Playlist,
 } from "@/lib/api";
 
 type Track = {
@@ -86,7 +92,7 @@ function fmtBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
-type View = "library" | "network" | "search";
+type View = "library" | "network" | "search" | "playlists";
 
 /** 播放顺序模式。顺序 → 单曲循环 → 列表循环，随机独立开关。 */
 type RepeatMode = "off" | "one" | "all";
@@ -120,6 +126,8 @@ function App() {
   const [authOpen, setAuthOpen] = useState(false);
   /** 搜索关键词。 */
   const [query, setQuery] = useState("");
+  /** 播放列表（持久化）。 */
+  const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const nextId = useRef(100);
 
@@ -197,6 +205,20 @@ function App() {
       console.error("list shared failed", e);
     }
   }, []);
+
+  const refreshPlaylists = useCallback(async () => {
+    if (!isTauri()) return;
+    try {
+      setPlaylists(await listPlaylists());
+    } catch (e) {
+      console.error("list playlists failed", e);
+    }
+  }, []);
+
+  // 启动时加载播放列表。
+  useEffect(() => {
+    void refreshPlaylists();
+  }, [refreshPlaylists]);
 
   // 进入"节点网络"视图时刷新共享曲库。搜索也要覆盖网络，所以一并刷新。
   useEffect(() => {
@@ -528,7 +550,12 @@ function App() {
             active={view === "library"}
             onClick={() => setView("library")}
           />
-          <NavItem icon={<ListMusic className="size-4" />} label="播放列表" />
+          <NavItem
+            icon={<ListMusic className="size-4" />}
+            label="播放列表"
+            active={view === "playlists"}
+            onClick={() => setView("playlists")}
+          />
           <NavItem
             icon={<Users className="size-4" />}
             label="节点网络"
@@ -632,6 +659,30 @@ function App() {
               onPlay={playTrack}
               onStreamPlay={onStreamPlay}
               onDownload={onDownload}
+            />
+          ) : view === "playlists" ? (
+            <PlaylistView
+              playlists={playlists}
+              tracks={tracks}
+              current={current}
+              onPlay={playTrack}
+              onRefresh={refreshPlaylists}
+              onCreate={async (name) => {
+                await createPlaylist(name);
+                void refreshPlaylists();
+              }}
+              onDelete={async (id) => {
+                await deletePlaylist(id);
+                void refreshPlaylists();
+              }}
+              onAddTrack={async (id, hash) => {
+                await addToPlaylist(id, hash);
+                void refreshPlaylists();
+              }}
+              onRemoveTrack={async (id, index) => {
+                await removeFromPlaylist(id, index);
+                void refreshPlaylists();
+              }}
             />
           ) : (
             <NetworkView
@@ -1221,6 +1272,253 @@ function SearchView({
           )}
         </div>
       )}
+    </>
+  );
+}
+
+/**
+ * 播放列表视图 —— 左侧列表清单，右侧展开的曲目。
+ *
+ * 列表只存 `track_hash` 引用，这里再去曲库里解析成完整曲目。解析不到的
+ * （曲目已从曲库移除）标成"不可用"而不是隐藏 —— 用户需要知道那一行为什么
+ * 点不动，静默消失只会让人以为是 bug。
+ */
+function PlaylistView({
+  playlists,
+  tracks,
+  current,
+  onPlay,
+  onRefresh,
+  onCreate,
+  onDelete,
+  onAddTrack,
+  onRemoveTrack,
+}: {
+  playlists: Playlist[];
+  tracks: Track[];
+  current: Track | null;
+  onPlay: (t: Track) => void;
+  onRefresh: () => void;
+  onCreate: (name: string) => void;
+  onDelete: (id: string) => void;
+  onAddTrack: (id: string, trackHash: string) => void;
+  onRemoveTrack: (id: string, index: number) => void;
+}) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const [newName, setNewName] = useState("");
+  const [adding, setAdding] = useState(false);
+
+  // 选中的列表被删掉时回到"未选中"，避免停在一个不存在的 id 上。
+  const active = playlists.find((p) => p.id === selected) ?? null;
+  useEffect(() => {
+    if (selected && !playlists.some((p) => p.id === selected)) setSelected(null);
+  }, [playlists, selected]);
+
+  /** track_hash → 曲库里的曲目。 */
+  const byHash = new Map(
+    tracks.filter((t) => t.manifest).map((t) => [t.manifest!.track_hash, t])
+  );
+  /** 还没进当前列表的曲库曲目 —— 「添加曲目」的候选。 */
+  const candidates = tracks.filter(
+    (t) => t.manifest && !active?.tracks.includes(t.manifest.track_hash)
+  );
+
+  function submitNew() {
+    const name = newName.trim();
+    if (!name) return;
+    onCreate(name);
+    setNewName("");
+  }
+
+  return (
+    <>
+      <div className="mb-6 flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">播放列表</h1>
+          <p className="text-sm text-muted-foreground">
+            列表只记顺序，曲目本身在曲库里 —— 同一首歌进多个列表不会占额外空间
+          </p>
+        </div>
+        <Button variant="outline" onClick={onRefresh}>
+          <RefreshCw /> 刷新
+        </Button>
+      </div>
+
+      <div className="flex gap-6">
+        {/* 列表清单 */}
+        <div className="w-64 shrink-0 space-y-2">
+          <div className="flex gap-1">
+            <input
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submitNew()}
+              placeholder="新建列表名…"
+              className="min-w-0 flex-1 rounded border border-input bg-background px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+            />
+            <Button
+              size="icon"
+              variant="secondary"
+              className="size-8"
+              title="新建播放列表"
+              onClick={submitNew}
+            >
+              <Plus className="size-4" />
+            </Button>
+          </div>
+
+          {playlists.length === 0 ? (
+            <div className="rounded-md border border-dashed border-border p-4 text-center text-xs text-muted-foreground">
+              还没有播放列表。
+            </div>
+          ) : (
+            <div className="overflow-hidden rounded-md border border-border">
+              {playlists.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => setSelected(p.id)}
+                  className={cn(
+                    "flex w-full items-center gap-2 border-b border-border px-3 py-2 text-left text-sm last:border-b-0 transition-colors",
+                    selected === p.id
+                      ? "bg-accent/50 text-foreground"
+                      : "text-muted-foreground hover:bg-secondary/50"
+                  )}
+                >
+                  <ListMusic className="size-3.5 shrink-0" />
+                  <span className="min-w-0 flex-1 truncate">{p.name}</span>
+                  <span className="shrink-0 text-xs tabular-nums opacity-70">
+                    {p.tracks.length}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* 选中列表的曲目 */}
+        <div className="min-w-0 flex-1">
+          {!active ? (
+            <div className="rounded-lg border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
+              左侧选一个播放列表，或新建一个。
+            </div>
+          ) : (
+            <>
+              <div className="mb-3 flex items-center justify-between">
+                <h2 className="flex items-center gap-2 text-lg font-semibold">
+                  {active.name}
+                  <span className="text-sm font-normal text-muted-foreground tabular-nums">
+                    {active.tracks.length} 首
+                  </span>
+                </h2>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    disabled={candidates.length === 0}
+                    onClick={() => setAdding((v) => !v)}
+                    title={
+                      candidates.length === 0
+                        ? "曲库里的曲目都已在这个列表里"
+                        : "从曲库添加曲目"
+                    }
+                  >
+                    <Plus className="size-3.5" /> 添加曲目
+                  </Button>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="size-8 text-muted-foreground hover:text-destructive"
+                    title="删除这个播放列表（不影响曲库）"
+                    onClick={() => onDelete(active.id)}
+                  >
+                    <Trash2 className="size-3.5" />
+                  </Button>
+                </div>
+              </div>
+
+              {adding && candidates.length > 0 && (
+                <div className="mb-3 max-h-48 overflow-y-auto rounded-md border border-border bg-secondary/20">
+                  {candidates.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => {
+                        onAddTrack(active.id, t.manifest!.track_hash);
+                        setAdding(false);
+                      }}
+                      className="flex w-full items-center gap-2 border-b border-border px-3 py-2 text-left text-sm last:border-b-0 hover:bg-accent/50"
+                    >
+                      <Plus className="size-3.5 shrink-0 text-primary" />
+                      <span className="min-w-0 flex-1 truncate">{t.title}</span>
+                      <span className="w-32 shrink-0 truncate text-xs text-muted-foreground">
+                        {t.artist}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {active.tracks.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
+                  这个列表还是空的。点「添加曲目」从曲库里挑。
+                </div>
+              ) : (
+                <div className="overflow-hidden rounded-lg border border-border">
+                  {active.tracks.map((hash, i) => {
+                    const t = byHash.get(hash);
+                    return (
+                      <div
+                        key={`${hash}-${i}`}
+                        onClick={() => t?.url && onPlay(t)}
+                        className={cn(
+                          "flex items-center gap-3 border-b border-border px-4 py-2.5 text-sm last:border-b-0 transition-colors",
+                          t?.url
+                            ? "cursor-pointer hover:bg-accent/50"
+                            : "opacity-60",
+                          t && current?.id === t.id && "bg-accent/40"
+                        )}
+                      >
+                        <span className="w-6 shrink-0 text-right text-muted-foreground tabular-nums">
+                          {i + 1}
+                        </span>
+                        {t ? (
+                          <>
+                            <span className="min-w-0 flex-1 truncate font-medium">
+                              {t.title}
+                            </span>
+                            <span className="w-40 shrink-0 truncate text-muted-foreground">
+                              {t.artist}
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                              {hash.slice(0, 16)}…
+                            </span>
+                            <span className="w-40 shrink-0 text-xs text-destructive">
+                              不可用（已从曲库移除）
+                            </span>
+                          </>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-7 shrink-0 text-muted-foreground hover:text-destructive"
+                          title="从这个列表移除"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onRemoveTrack(active.id, i);
+                          }}
+                        >
+                          <X className="size-3.5" />
+                        </Button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
     </>
   );
 }
